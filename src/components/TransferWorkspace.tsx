@@ -106,6 +106,14 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
       item.transferId !== dismissedConfirmationId
   );
 
+  const latestReceivedReady = transfers.find(
+    (item) =>
+      item.direction === 'receive' &&
+      item.status === 'completed' &&
+      Boolean(item.blobUrl) &&
+      item.transferId !== dismissedConfirmationId
+  );
+
   // Reset dismissal when a newer sent transfer completes
   const latestSentId = transfers.find(
     (item) => item.direction === 'send' && item.status === 'completed'
@@ -145,9 +153,17 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
       case 'transferring':
         return t.statusTransferring;
       case 'verifying':
-        return t.statusVerifying;
+        return rec.direction === 'receive'
+          ? lang === 'hi'
+            ? 'फाइल की गुणवत्ता (CRC-32) चेक हो रही है...'
+            : 'Verifying lossless checksum...'
+          : t.statusVerifying;
       case 'completed':
-        return t.statusCompleted;
+        return rec.direction === 'receive'
+          ? lang === 'hi'
+            ? 'फाइल मिल गई — सेव करने के लिए तैयार'
+            : 'Received — Ready to Save'
+          : t.statusCompleted;
       case 'declined':
         return t.statusDeclined;
       case 'cancelled':
@@ -406,6 +422,58 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
           >
             {t.dismissBanner}
           </button>
+        </section>
+      )}
+
+      {/* Received & Ready to Save Banner */}
+      {latestReceivedReady && latestReceivedReady.blobUrl && (
+        <section
+          role="status"
+          className="bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/80 rounded-2xl p-4 sm:p-5 space-y-3"
+        >
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-start gap-3 min-w-0">
+              <CheckCircle2 className="w-5 h-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-emerald-900 dark:text-emerald-200 truncate">
+                  {lang === 'hi' ? 'फाइल रिसीव हो गई!' : 'File received!'} · {latestReceivedReady.fileName}
+                </h3>
+                <p className="mt-0.5 text-xs sm:text-sm text-emerald-800 dark:text-emerald-300 tabular-nums">
+                  {formatBytes(latestReceivedReady.fileSize)} · {latestReceivedReady.peerName} · CRC32 {latestReceivedReady.crc32Actual}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setDismissedConfirmationId(latestReceivedReady.transferId)}
+              className="min-h-[36px] px-2.5 text-xs font-medium text-emerald-800 dark:text-emerald-300 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 rounded-lg transition-colors shrink-0"
+            >
+              {t.dismissBanner}
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => onDownloadFile(latestReceivedReady.blobUrl!, latestReceivedReady.fileName)}
+              className="min-h-[44px] px-5 py-2.5 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-sm font-semibold transition-colors inline-flex items-center gap-2 whitespace-nowrap"
+            >
+              <Download className="w-4 h-4" />
+              <span>{lang === 'hi' ? 'फोन में सेव करें (Save)' : 'Save to Device'}</span>
+            </button>
+            {(latestReceivedReady.category === 'video' ||
+              latestReceivedReady.category === 'audio' ||
+              latestReceivedReady.category === 'image') && (
+              <button
+                type="button"
+                onClick={() => onPreviewMedia(latestReceivedReady)}
+                className="min-h-[44px] px-4 py-2.5 rounded-xl border border-emerald-300 dark:border-emerald-700 bg-white dark:bg-slate-900 text-emerald-900 dark:text-emerald-200 text-sm font-medium hover:bg-emerald-100/70 dark:hover:bg-emerald-900/40 transition-colors inline-flex items-center gap-2 whitespace-nowrap"
+              >
+                <Play className="w-4 h-4" />
+                <span>{t.previewMedia}</span>
+              </button>
+            )}
+          </div>
         </section>
       )}
 

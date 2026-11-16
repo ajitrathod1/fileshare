@@ -187,6 +187,7 @@ export function useBeamDrop() {
 
   const outgoingBatchesRef = useRef<Map<string, PendingOutgoingBatch>>(new Map());
   const receivingRef = useRef<Map<string, ActiveReceiveState>>(new Map());
+  const handleSignalingMessageRef = useRef<(msg: Record<string, unknown>) => void>(() => {});
 
   useEffect(() => {
     autoAcceptRef.current = autoAccept;
@@ -309,8 +310,25 @@ export function useBeamDrop() {
     );
   }, []);
 
+  const sendPeerControl = useCallback(
+    (targetId: string, payload: Record<string, unknown>) => {
+      const dc = dataChannelsRef.current.get(targetId);
+      if (dc && dc.readyState === 'open') {
+        try {
+          dc.send(JSON.stringify(payload));
+        } catch {
+          // fallback to signaling channel below
+        }
+      }
+      sendWsJson(payload);
+    },
+    [sendWsJson]
+  );
+
   const finalizeReceive = useCallback(
     (state: ActiveReceiveState, expectedBytes: number, expectedCrc: string) => {
+      if (!receivingRef.current.has(state.transferId)) return;
+
       const actualCrc = state.crc.digestHex();
       const sizeMatch = state.receivedBytes === expectedBytes;
       const crcMatch = actualCrc === expectedCrc;
@@ -344,7 +362,7 @@ export function useBeamDrop() {
         triggerBrowserDownload(blobUrl, state.fileName);
       }
 
-      sendWsJson({
+      sendPeerControl(state.peerId, {
         type: 'transfer:ack',
         targetId: state.peerId,
         transferId: state.transferId,
@@ -352,7 +370,7 @@ export function useBeamDrop() {
         crc32: actualCrc,
       });
     },
-    [sendWsJson, updateTransfer]
+    [sendPeerControl, updateTransfer]
   );
 
   const handleIncomingBinaryFrame = useCallback(
@@ -434,6 +452,15 @@ export function useBeamDrop() {
       };
 
       dc.onmessage = (event) => {
+        if (typeof event.data === 'string') {
+          try {
+            const parsed = JSON.parse(event.data) as Record<string, unknown>;
+            handleSignalingMessageRef.current(parsed);
+          } catch {
+            // ignore malformed control frame
+          }
+          return;
+        }
         if (event.data instanceof ArrayBuffer) {
           handleIncomingBinaryFrame(event.data, 'webrtc-p2p');
         } else if (event.data instanceof Blob) {
@@ -664,7 +691,7 @@ export function useBeamDrop() {
               status: 'verifying',
               crc32Expected: finalCrc,
             });
-            sendWsJson({
+            sendPeerControl(targetId, {
               type: 'transfer:complete',
               targetId,
               transferId,
@@ -683,7 +710,7 @@ export function useBeamDrop() {
 
       outgoingBatchesRef.current.delete(batch.batchId);
     },
-    [sendWsJson, updateTransfer, waitForDataChannelOrFallback]
+    [sendPeerControl, sendWsJson, updateTransfer, waitForDataChannelOrFallback]
   );
 
   const acceptOfferBatch = useCallback(
@@ -985,6 +1012,10 @@ export function useBeamDrop() {
       updateTransfer,
     ]
   );
+
+  useEffect(() => {
+    handleSignalingMessageRef.current = handleSignalingMessage;
+  }, [handleSignalingMessage]);
 
   useEffect(() => {
     let unmounted = false;
