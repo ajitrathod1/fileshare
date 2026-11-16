@@ -15,11 +15,13 @@ import {
 } from '../utils/crc32';
 import { MqttWssClient } from '../utils/mqttSignaling';
 
-const CHUNK_SIZE = 64 * 1024; // 64 KB — universally safe for WebRTC SCTP on iOS Safari, Android Chrome, and Desktop
+const SAFE_CHUNK_SIZE = 64 * 1024; // 64 KB — universally safe for Safari / iOS WebRTC SCTP
+const FAST_P2P_CHUNK_SIZE = 192 * 1024; // 192 KB — high-throughput SCTP chunks when maxMessageSize >= 256 KB
+const READ_BLOCK_SIZE = 4 * 1024 * 1024; // 4 MB disk read block to eliminate per-chunk slice IPC overhead
 const MQTT_RELAY_CHUNK_SIZE = 32 * 1024; // 32 KB when relaying over MQTT WSS fallback
-const DC_HIGH_WATER_MARK = 1024 * 1024; // 1 MB
-const DC_LOW_WATER_THRESHOLD = 256 * 1024; // 256 KB
-const WEBRTC_CONNECT_TIMEOUT_MS = 4500;
+const DC_HIGH_WATER_MARK = 8 * 1024 * 1024; // 8 MB pipeline keeps Wi-Fi/LAN link saturated
+const DC_LOW_WATER_THRESHOLD = 2 * 1024 * 1024; // 2 MB low-water mark
+const WEBRTC_CONNECT_TIMEOUT_MS = 6500;
 const MQTT_NS = 'beamdrop_p2p_v1';
 
 const ICE_SERVERS: RTCConfiguration = {
@@ -75,7 +77,13 @@ interface ActiveReceiveState {
   fileSize: number;
   mimeType: string;
   category: TransferRecord['category'];
-  chunks: Uint8Array[];
+  opfsRoot?: FileSystemDirectoryHandle;
+  opfsName?: string;
+  opfsHandle?: FileSystemFileHandle;
+  writable?: FileSystemWritableFileStream;
+  writeChain: Promise<void>;
+  blobBatches: Blob[];
+  chunks: Uint8Array<ArrayBuffer>[];
   receivedBytes: number;
   expectedChunkIndex: number;
   crc: IncrementalCRC32;
@@ -83,6 +91,7 @@ interface ActiveReceiveState {
   lastSpeedAt: number;
   lastSpeedBytes: number;
   transport: TransportMode;
+  finalizing?: boolean;
   pendingCompletion?: {
     totalBytes: number;
     crc32: string;
@@ -187,6 +196,7 @@ export function useBeamDrop() {
 
   const outgoingBatchesRef = useRef<Map<string, PendingOutgoingBatch>>(new Map());
   const receivingRef = useRef<Map<string, ActiveReceiveState>>(new Map());
+  const opfsFilesRef = useRef<Map<string, { root: FileSystemDirectoryHandle; name: string }>>(new Map());
   const handleSignalingMessageRef = useRef<(msg: Record<string, unknown>) => void>(() => {});
 
   useEffect(() => {
@@ -325,40 +335,74 @@ export function useBeamDrop() {
     [sendWsJson]
   );
 
+  const cleanupReceiveState = useCallback((state: ActiveReceiveState) => {
+    state.chunks = [];
+    state.blobBatches = [];
+    if (state.writable) {
+      state.writable.abort().catch(() => {});
+      state.writable = undefined;
+    }
+    if (state.opfsRoot && state.opfsName) {
+      state.opfsRoot.removeEntry(state.opfsName).catch(() => {});
+    }
+  }, []);
+
   const finalizeReceive = useCallback(
-    (state: ActiveReceiveState, expectedBytes: number, expectedCrc: string) => {
-      if (!receivingRef.current.has(state.transferId)) return;
+    async (state: ActiveReceiveState, expectedBytes: number, expectedCrc: string) => {
+      if (!receivingRef.current.has(state.transferId) || state.finalizing) return;
+      state.finalizing = true;
+      receivingRef.current.delete(state.transferId);
 
       const actualCrc = state.crc.digestHex();
       const sizeMatch = state.receivedBytes === expectedBytes;
       const crcMatch = actualCrc === expectedCrc;
       const verified = sizeMatch && crcMatch;
 
-      const blobParts = state.chunks.map(
-        (c) => c.buffer.slice(c.byteOffset, c.byteOffset + c.byteLength) as ArrayBuffer
-      );
-      const blob = new Blob(blobParts, { type: state.mimeType || 'application/octet-stream' });
-      const blobUrl = URL.createObjectURL(blob);
+      let blobUrl = '';
+      let writeError: string | undefined;
 
-      state.chunks = [];
-      receivingRef.current.delete(state.transferId);
+      try {
+        await state.writeChain;
+        if (state.writable && state.opfsHandle) {
+          await state.writable.close();
+          state.writable = undefined;
+          const diskFile = await state.opfsHandle.getFile();
+          blobUrl = URL.createObjectURL(diskFile);
+          if (state.opfsRoot && state.opfsName) {
+            opfsFilesRef.current.set(state.transferId, {
+              root: state.opfsRoot,
+              name: state.opfsName,
+            });
+          }
+        } else {
+          const parts: BlobPart[] = [...state.blobBatches, ...state.chunks];
+          const blob = new Blob(parts, { type: state.mimeType || 'application/octet-stream' });
+          blobUrl = URL.createObjectURL(blob);
+          state.blobBatches = [];
+          state.chunks = [];
+        }
+      } catch (err) {
+        writeError = err instanceof Error ? err.message : 'Failed to finalize received file';
+      }
+
+      const finalSuccess = verified && Boolean(blobUrl) && !writeError;
 
       updateTransfer(state.transferId, {
         bytesTransferred: state.receivedBytes,
         speedBps: 0,
         etaSeconds: 0,
-        status: verified ? 'completed' : 'error',
+        status: finalSuccess ? 'completed' : 'error',
         crc32Expected: expectedCrc,
         crc32Actual: actualCrc,
-        verifiedLossless: verified,
-        blobUrl,
+        verifiedLossless: finalSuccess,
+        blobUrl: finalSuccess ? blobUrl : undefined,
         completedAt: Date.now(),
-        errorMessage: verified
+        errorMessage: finalSuccess
           ? undefined
-          : `Checksum mismatch (expected ${expectedCrc}, got ${actualCrc})`,
+          : writeError || `Checksum mismatch (expected ${expectedCrc}, got ${actualCrc})`,
       });
 
-      if (verified && autoDownloadRef.current) {
+      if (finalSuccess && autoDownloadRef.current) {
         triggerBrowserDownload(blobUrl, state.fileName);
       }
 
@@ -366,7 +410,7 @@ export function useBeamDrop() {
         type: 'transfer:ack',
         targetId: state.peerId,
         transferId: state.transferId,
-        verified,
+        verified: finalSuccess,
         crc32: actualCrc,
       });
     },
@@ -382,28 +426,38 @@ export function useBeamDrop() {
       if (cancelledTransfersRef.current.has(transferId)) return;
 
       const state = receivingRef.current.get(transferId);
-      if (!state) return;
+      if (!state || state.finalizing) return;
 
       if (chunkIndex !== state.expectedChunkIndex) {
         return;
       }
 
-      const copy = new Uint8Array(payload.length);
+      const copy = new Uint8Array(new ArrayBuffer(payload.length));
       copy.set(payload);
-      state.chunks.push(copy);
       state.crc.update(copy);
       state.receivedBytes += copy.length;
       state.expectedChunkIndex += 1;
       state.transport = transport;
 
+      if (state.writable) {
+        const writable = state.writable;
+        state.writeChain = state.writeChain.then(() => writable.write(copy)).catch(() => {});
+      } else {
+        state.chunks.push(copy);
+        if (state.chunks.length >= 256) {
+          state.blobBatches.push(new Blob(state.chunks));
+          state.chunks = [];
+        }
+      }
+
       const now = performance.now();
       const elapsedSinceSample = (now - state.lastSpeedAt) / 1000;
-      if (elapsedSinceSample >= 0.2 || state.receivedBytes >= state.fileSize) {
+      if (elapsedSinceSample >= 0.25 || state.receivedBytes >= state.fileSize) {
         const deltaBytes = state.receivedBytes - state.lastSpeedBytes;
         const instantSpeed = elapsedSinceSample > 0 ? deltaBytes / elapsedSinceSample : 0;
         const totalElapsed = Math.max((now - state.startedAt) / 1000, 0.05);
         const avgSpeed = state.receivedBytes / totalElapsed;
-        const speedBps = instantSpeed > 0 ? instantSpeed * 0.6 + avgSpeed * 0.4 : avgSpeed;
+        const speedBps = instantSpeed > 0 ? instantSpeed * 0.65 + avgSpeed * 0.35 : avgSpeed;
         const remaining = Math.max(state.fileSize - state.receivedBytes, 0);
         const etaSeconds = speedBps > 0 ? remaining / speedBps : null;
 
@@ -420,7 +474,7 @@ export function useBeamDrop() {
       }
 
       if (state.pendingCompletion && state.receivedBytes >= state.pendingCompletion.totalBytes) {
-        finalizeReceive(
+        void finalizeReceive(
           state,
           state.pendingCompletion.totalBytes,
           state.pendingCompletion.crc32
@@ -514,13 +568,14 @@ export function useBeamDrop() {
     [sendWsJson, setupDataChannel]
   );
 
-  const waitForDataChannelOrFallback = useCallback(
-    async (peerId: string): Promise<RTCDataChannel | null> => {
+  const prewarmPeerConnection = useCallback(
+    async (peerId: string) => {
       const existingDc = dataChannelsRef.current.get(peerId);
-      if (existingDc && existingDc.readyState === 'open') {
-        return existingDc;
+      if (existingDc && existingDc.readyState === 'open') return;
+      const existingPc = peerConnectionsRef.current.get(peerId);
+      if (existingPc && existingPc.connectionState !== 'failed' && existingPc.connectionState !== 'closed') {
+        return;
       }
-
       try {
         const pc = createPeerConnection(peerId, true);
         const offer = await pc.createOffer();
@@ -531,7 +586,46 @@ export function useBeamDrop() {
           sdp: pc.localDescription,
         });
       } catch {
-        return null;
+        // ignore prewarm error; send will retry or fallback cleanly
+      }
+    },
+    [createPeerConnection, sendWsJson]
+  );
+
+  useEffect(() => {
+    for (const p of connectedPeers) {
+      if (myPeerIdRef.current < p.id) {
+        void prewarmPeerConnection(p.id);
+      }
+    }
+    for (const p of roomPeers) {
+      if (myPeerIdRef.current < p.id) {
+        void prewarmPeerConnection(p.id);
+      }
+    }
+  }, [connectedPeers, prewarmPeerConnection, roomPeers]);
+
+  const waitForDataChannelOrFallback = useCallback(
+    async (peerId: string): Promise<RTCDataChannel | null> => {
+      const existingDc = dataChannelsRef.current.get(peerId);
+      if (existingDc && existingDc.readyState === 'open') {
+        return existingDc;
+      }
+
+      const existingPc = peerConnectionsRef.current.get(peerId);
+      if (!existingPc || existingPc.connectionState === 'failed' || existingPc.connectionState === 'closed') {
+        try {
+          const pc = createPeerConnection(peerId, true);
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          sendWsJson({
+            type: 'webrtc:offer',
+            targetId: peerId,
+            sdp: pc.localDescription,
+          });
+        } catch {
+          return null;
+        }
       }
 
       const started = Date.now();
@@ -544,7 +638,7 @@ export function useBeamDrop() {
         if (pc && (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed')) {
           return null;
         }
-        await new Promise((r) => setTimeout(r, 80));
+        await new Promise((r) => setTimeout(r, 50));
       }
       return null;
     },
@@ -571,7 +665,15 @@ export function useBeamDrop() {
 
       const dc = await waitForDataChannelOrFallback(targetId);
       const transport: TransportMode = dc && dc.readyState === 'open' ? 'webrtc-p2p' : 'ws-relay';
-      const chunkStep = transport === 'webrtc-p2p' ? CHUNK_SIZE : backendRef.current === 'mqtt' ? MQTT_RELAY_CHUNK_SIZE : CHUNK_SIZE;
+      const activePc = peerConnectionsRef.current.get(targetId);
+      const maxSctpMsg = activePc?.sctp?.maxMessageSize ?? 0;
+      const p2pChunkSize = maxSctpMsg >= 262144 ? FAST_P2P_CHUNK_SIZE : SAFE_CHUNK_SIZE;
+      const chunkStep =
+        transport === 'webrtc-p2p'
+          ? p2pChunkSize
+          : backendRef.current === 'mqtt'
+            ? MQTT_RELAY_CHUNK_SIZE
+            : SAFE_CHUNK_SIZE;
 
       for (const { manifest, file } of filesToSend) {
         const transferId = manifest.transferId;
@@ -600,85 +702,100 @@ export function useBeamDrop() {
               break;
             }
 
-            const end = Math.min(offset + chunkStep, file.size);
-            const sliceBuffer = await file.slice(offset, end).arrayBuffer();
-            const chunkBytes = new Uint8Array(sliceBuffer);
-            crc.update(chunkBytes);
+            // Read 4 MB disk block once instead of doing 64 KB slice IPC per chunk
+            const blockEnd = Math.min(offset + READ_BLOCK_SIZE, file.size);
+            const blockBuffer = await file.slice(offset, blockEnd).arrayBuffer();
+            const blockBytes = new Uint8Array(blockBuffer);
+            crc.update(blockBytes);
 
-            const dataFrame = encodeDataChunk(transferId, chunkIndex, chunkBytes);
+            let blockPos = 0;
+            while (blockPos < blockBytes.length) {
+              if (cancelledTransfersRef.current.has(transferId)) {
+                sendWsJson({ type: 'transfer:cancel', targetId, transferId });
+                updateTransfer(transferId, { status: 'cancelled' });
+                break;
+              }
 
-            let activeTransport: TransportMode = transport;
-            const liveDc = dataChannelsRef.current.get(targetId);
+              const sliceEnd = Math.min(blockPos + chunkStep, blockBytes.length);
+              const chunkView = blockBytes.subarray(blockPos, sliceEnd);
+              const dataFrame = encodeDataChunk(transferId, chunkIndex, chunkView);
 
-            if (activeTransport === 'webrtc-p2p' && liveDc && liveDc.readyState === 'open') {
-              if (liveDc.bufferedAmount > DC_HIGH_WATER_MARK) {
-                await new Promise<void>((resolve) => {
-                  const onLow = () => {
-                    liveDc.removeEventListener('bufferedamountlow', onLow);
-                    resolve();
-                  };
-                  liveDc.addEventListener('bufferedamountlow', onLow);
-                  setTimeout(() => {
-                    liveDc.removeEventListener('bufferedamountlow', onLow);
-                    resolve();
-                  }, 400);
-                });
-              }
-              liveDc.send(dataFrame.buffer as ArrayBuffer);
-            } else if (backendRef.current === 'ws') {
-              activeTransport = 'ws-relay';
-              const ws = wsRef.current;
-              if (!ws || ws.readyState !== WebSocket.OPEN) {
-                throw new Error('Connection lost during transfer.');
-              }
-              while (ws.bufferedAmount > 2 * 1024 * 1024) {
-                await new Promise((r) => setTimeout(r, 16));
-              }
-              const relayPacket = encodeWsRelayChunk(targetId, dataFrame);
-              ws.send(relayPacket.buffer as ArrayBuffer);
-            } else {
-              activeTransport = 'ws-relay';
-              const mqtt = mqttRef.current;
-              if (mqtt && mqtt.isConnected()) {
-                while (mqtt.getBufferedAmount() > 1024 * 1024) {
-                  await new Promise((r) => setTimeout(r, 20));
+              let activeTransport: TransportMode = transport;
+              const liveDc = dataChannelsRef.current.get(targetId);
+
+              if (activeTransport === 'webrtc-p2p' && liveDc && liveDc.readyState === 'open') {
+                while (liveDc.bufferedAmount > DC_HIGH_WATER_MARK && liveDc.readyState === 'open') {
+                  await new Promise<void>((resolve) => {
+                    let timer: number | undefined;
+                    const done = () => {
+                      liveDc.removeEventListener('bufferedamountlow', done);
+                      if (timer !== undefined) window.clearTimeout(timer);
+                      resolve();
+                    };
+                    liveDc.addEventListener('bufferedamountlow', done);
+                    timer = window.setTimeout(done, 12);
+                  });
                 }
-                mqtt.publishBytes(`${MQTT_NS}/bin/${targetId}`, dataFrame);
-              } else if (broadcastRef.current) {
-                broadcastRef.current.postMessage({
-                  kind: 'bin',
-                  targetId,
-                  buffer: dataFrame.buffer.slice(0),
-                });
+                if (liveDc.readyState !== 'open') {
+                  throw new Error('P2P channel closed during transfer.');
+                }
+                liveDc.send(dataFrame.buffer as ArrayBuffer);
+              } else if (backendRef.current === 'ws') {
+                activeTransport = 'ws-relay';
+                const ws = wsRef.current;
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                  throw new Error('Connection lost during transfer.');
+                }
+                while (ws.bufferedAmount > 4 * 1024 * 1024) {
+                  await new Promise((r) => setTimeout(r, 12));
+                }
+                const relayPacket = encodeWsRelayChunk(targetId, dataFrame);
+                ws.send(relayPacket.buffer as ArrayBuffer);
               } else {
-                throw new Error('P2P & relay channel unavailable.');
+                activeTransport = 'ws-relay';
+                const mqtt = mqttRef.current;
+                if (mqtt && mqtt.isConnected()) {
+                  while (mqtt.getBufferedAmount() > 1024 * 1024) {
+                    await new Promise((r) => setTimeout(r, 16));
+                  }
+                  mqtt.publishBytes(`${MQTT_NS}/bin/${targetId}`, dataFrame);
+                } else if (broadcastRef.current) {
+                  broadcastRef.current.postMessage({
+                    kind: 'bin',
+                    targetId,
+                    buffer: dataFrame.buffer.slice(0),
+                  });
+                } else {
+                  throw new Error('P2P & relay channel unavailable.');
+                }
               }
-            }
 
-            offset = end;
-            chunkIndex += 1;
+              blockPos = sliceEnd;
+              offset += chunkView.length;
+              chunkIndex += 1;
 
-            const now = performance.now();
-            const elapsedSinceSample = (now - lastSpeedAt) / 1000;
-            if (elapsedSinceSample >= 0.2 || offset >= file.size) {
-              const deltaBytes = offset - lastSpeedBytes;
-              const instantSpeed = elapsedSinceSample > 0 ? deltaBytes / elapsedSinceSample : 0;
-              const totalElapsed = Math.max((now - startedAt) / 1000, 0.05);
-              const avgSpeed = offset / totalElapsed;
-              const speedBps = instantSpeed > 0 ? instantSpeed * 0.6 + avgSpeed * 0.4 : avgSpeed;
-              const remaining = Math.max(file.size - offset, 0);
-              const etaSeconds = speedBps > 0 ? remaining / speedBps : null;
+              const now = performance.now();
+              const elapsedSinceSample = (now - lastSpeedAt) / 1000;
+              if (elapsedSinceSample >= 0.25 || offset >= file.size) {
+                const deltaBytes = offset - lastSpeedBytes;
+                const instantSpeed = elapsedSinceSample > 0 ? deltaBytes / elapsedSinceSample : 0;
+                const totalElapsed = Math.max((now - startedAt) / 1000, 0.05);
+                const avgSpeed = offset / totalElapsed;
+                const speedBps = instantSpeed > 0 ? instantSpeed * 0.65 + avgSpeed * 0.35 : avgSpeed;
+                const remaining = Math.max(file.size - offset, 0);
+                const etaSeconds = speedBps > 0 ? remaining / speedBps : null;
 
-              lastSpeedAt = now;
-              lastSpeedBytes = offset;
+                lastSpeedAt = now;
+                lastSpeedBytes = offset;
 
-              updateTransfer(transferId, {
-                bytesTransferred: offset,
-                speedBps,
-                etaSeconds,
-                transport: activeTransport,
-                status: offset >= file.size ? 'verifying' : 'transferring',
-              });
+                updateTransfer(transferId, {
+                  bytesTransferred: offset,
+                  speedBps,
+                  etaSeconds,
+                  transport: activeTransport,
+                  status: offset >= file.size ? 'verifying' : 'transferring',
+                });
+              }
             }
           }
 
@@ -714,12 +831,39 @@ export function useBeamDrop() {
   );
 
   const acceptOfferBatch = useCallback(
-    (batch: IncomingOfferBatch) => {
+    async (batch: IncomingOfferBatch) => {
       const now = Date.now();
       const acceptedIds: string[] = [];
 
-      const newRecords: TransferRecord[] = batch.files.map((f) => {
+      let opfsRoot: FileSystemDirectoryHandle | undefined;
+      if (typeof navigator !== 'undefined' && navigator.storage?.getDirectory) {
+        try {
+          opfsRoot = await navigator.storage.getDirectory();
+        } catch {
+          opfsRoot = undefined;
+        }
+      }
+
+      const newRecords: TransferRecord[] = [];
+      for (const f of batch.files) {
         acceptedIds.push(f.transferId);
+
+        let opfsName: string | undefined;
+        let opfsHandle: FileSystemFileHandle | undefined;
+        let writable: FileSystemWritableFileStream | undefined;
+
+        if (opfsRoot) {
+          try {
+            opfsName = `bd_${f.transferId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
+            opfsHandle = await opfsRoot.getFileHandle(opfsName, { create: true });
+            writable = await opfsHandle.createWritable();
+          } catch {
+            opfsName = undefined;
+            opfsHandle = undefined;
+            writable = undefined;
+          }
+        }
+
         receivingRef.current.set(f.transferId, {
           transferId: f.transferId,
           batchId: batch.batchId,
@@ -729,6 +873,12 @@ export function useBeamDrop() {
           fileSize: f.size,
           mimeType: f.mimeType,
           category: f.category,
+          opfsRoot: writable ? opfsRoot : undefined,
+          opfsName: writable ? opfsName : undefined,
+          opfsHandle: writable ? opfsHandle : undefined,
+          writable,
+          writeChain: Promise.resolve(),
+          blobBatches: [],
           chunks: [],
           receivedBytes: 0,
           expectedChunkIndex: 0,
@@ -739,7 +889,7 @@ export function useBeamDrop() {
           transport: 'webrtc-p2p',
         });
 
-        return {
+        newRecords.push({
           transferId: f.transferId,
           batchId: batch.batchId,
           peerId: batch.fromPeer.id,
@@ -756,8 +906,8 @@ export function useBeamDrop() {
           transport: 'webrtc-p2p',
           verifiedLossless: false,
           createdAt: now,
-        };
-      });
+        });
+      }
 
       setTransfers((prev) => [...newRecords, ...prev]);
       setIncomingOffers((prev) => prev.filter((o) => o.batchId !== batch.batchId));
@@ -823,7 +973,13 @@ export function useBeamDrop() {
         if (msg.scope === 'nearby') {
           setNearbyPeers(list.map((p) => ({ ...p, scope: 'nearby' })));
         } else if (msg.scope === 'pair') {
-          setRoomPeers(list.map((p) => ({ ...p, scope: 'pair' })));
+          const paired = list.map((p) => ({ ...p, scope: 'pair' as const }));
+          setRoomPeers(paired);
+          paired.forEach((p) => {
+            if (myPeerIdRef.current < p.id) {
+              void prewarmPeerConnection(p.id);
+            }
+          });
         } else if (msg.scope === 'available') {
           setAvailablePeers(list.map((p) => ({ ...p, scope: 'available' })));
           setConnectedPeers((prev) =>
@@ -865,6 +1021,9 @@ export function useBeamDrop() {
           return [peer, ...prev];
         });
         setConnectionStates((prev) => ({ ...prev, [peer.id]: 'connected' }));
+        if (myPeerIdRef.current < peer.id) {
+          void prewarmPeerConnection(peer.id);
+        }
         return;
       }
 
@@ -933,7 +1092,7 @@ export function useBeamDrop() {
           createdAt: Date.now(),
         };
         if (autoAcceptRef.current) {
-          acceptOfferBatch(batch);
+          void acceptOfferBatch(batch);
         } else {
           setIncomingOffers((prev) => [...prev, batch]);
         }
@@ -945,7 +1104,7 @@ export function useBeamDrop() {
         const acceptedIds = Array.isArray(msg.acceptedIds) ? (msg.acceptedIds as string[]) : [];
         const batch = outgoingBatchesRef.current.get(batchId);
         if (batch) {
-          executeOutgoingBatch(batch, acceptedIds);
+          void executeOutgoingBatch(batch, acceptedIds);
         }
         return;
       }
@@ -969,7 +1128,7 @@ export function useBeamDrop() {
         const state = receivingRef.current.get(transferId);
         if (state) {
           if (state.receivedBytes >= totalBytes) {
-            finalizeReceive(state, totalBytes, crc32);
+            void finalizeReceive(state, totalBytes, crc32);
           } else {
             state.pendingCompletion = { totalBytes, crc32 };
           }
@@ -996,17 +1155,19 @@ export function useBeamDrop() {
         cancelledTransfersRef.current.add(transferId);
         const state = receivingRef.current.get(transferId);
         if (state) {
-          state.chunks = [];
           receivingRef.current.delete(transferId);
+          cleanupReceiveState(state);
         }
         updateTransfer(transferId, { status: 'cancelled' });
       }
     },
     [
       acceptOfferBatch,
+      cleanupReceiveState,
       createPeerConnection,
       executeOutgoingBatch,
       finalizeReceive,
+      prewarmPeerConnection,
       sendWsJson,
       setRoomCode,
       updateTransfer,
@@ -1347,26 +1508,32 @@ export function useBeamDrop() {
       cancelledTransfersRef.current.add(transferId);
       const recv = receivingRef.current.get(transferId);
       if (recv) {
-        recv.chunks = [];
         receivingRef.current.delete(transferId);
+        cleanupReceiveState(recv);
       }
       sendWsJson({ type: 'transfer:cancel', targetId: peerId, transferId });
       updateTransfer(transferId, { status: 'cancelled' });
     },
-    [sendWsJson, updateTransfer]
+    [cleanupReceiveState, sendWsJson, updateTransfer]
   );
 
   const clearCompletedTransfers = useCallback(() => {
     setTransfers((prev) => {
       prev.forEach((t) => {
         if (
-          (t.status === 'completed' ||
-            t.status === 'declined' ||
-            t.status === 'cancelled' ||
-            t.status === 'error') &&
-          t.blobUrl
+          t.status === 'completed' ||
+          t.status === 'declined' ||
+          t.status === 'cancelled' ||
+          t.status === 'error'
         ) {
-          URL.revokeObjectURL(t.blobUrl);
+          if (t.blobUrl) {
+            URL.revokeObjectURL(t.blobUrl);
+          }
+          const opfsEntry = opfsFilesRef.current.get(t.transferId);
+          if (opfsEntry) {
+            opfsEntry.root.removeEntry(opfsEntry.name).catch(() => {});
+            opfsFilesRef.current.delete(t.transferId);
+          }
         }
       });
       return prev.filter(
@@ -1409,9 +1576,12 @@ export function useBeamDrop() {
           targetId: req.fromPeer.id,
           peer: getMySelfPeer(),
         });
+        if (myPeerIdRef.current < req.fromPeer.id) {
+          void prewarmPeerConnection(req.fromPeer.id);
+        }
       }
     },
-    [getMySelfPeer, sendWsJson]
+    [getMySelfPeer, prewarmPeerConnection, sendWsJson]
   );
 
   const skipConnectionRequest = useCallback(

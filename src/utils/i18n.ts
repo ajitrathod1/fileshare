@@ -81,6 +81,9 @@ export const COPY: Record<
     statusDeclined: string;
     statusCancelled: string;
     statusError: string;
+    transportP2P: string;
+    transportRelay: string;
+    slowLargeFileTip: string;
   }
 > = {
   en: {
@@ -153,7 +156,7 @@ export const COPY: Record<
     howStep1Title: '01. Find & Connect',
     howStep1Body: 'Available devices appear automatically. Tap Connect to send a quick request — the other device can tap Connect or Skip.',
     howStep2Title: '02. Select original media',
-    howStep2Body: 'Pick videos, audio recordings, photos, or ZIP archives. Files stream in 64 KB binary frames without server compression.',
+    howStep2Body: 'Pick videos, audio recordings, photos, or ZIP archives. Files stream in 4 MB disk blocks over an 8 MB WebRTC pipeline and write directly to disk without filling phone RAM.',
     howStep3Title: '03. Verified arrival',
     howStep3Body: 'WebRTC DataChannel transfers directly device-to-device with CRC-32 checksum verification. Nothing is ever saved in a backend database or cloud storage.',
     statusWaiting: 'Waiting for receiver to tap Accept...',
@@ -164,6 +167,10 @@ export const COPY: Record<
     statusDeclined: 'Declined by receiver',
     statusCancelled: 'Cancelled',
     statusError: 'Failed',
+    transportP2P: 'Direct Wi-Fi / LAN P2P',
+    transportRelay: 'Internet Relay',
+    slowLargeFileTip:
+      'Large file speed tip: Connect both phones to the same Wi-Fi (or turn on Mobile Hotspot on one phone and connect the other) for 20–80 MB/s Direct P2P speed instead of slow cellular relay.',
   },
   hi: {
     navTransfer: 'शेयर करें',
@@ -235,7 +242,7 @@ export const COPY: Record<
     howStep1Title: '01. डिवाइस खोजें और Connect करें',
     howStep1Body: 'उपलब्ध डिवाइस अपने-आप दिखते हैं। Connect दबाने पर दूसरे फोन को मैसेज जाता है — वो Connect या Skip कर सकता है।',
     howStep2Title: '02. ओरिजिनल फाइल चुनें',
-    howStep2Body: 'वीडियो, गाने, रिकॉर्डिंग या कोई भी फाइल बिना कंप्रेस किए सीधे 64 KB बाइनरी चंक्स में भेजी जाती है।',
+    howStep2Body: 'वीडियो, गाने, फोटो या कोई भी बड़ी फाइल बिना कंप्रेस किए 4 MB ब्लॉक स्ट्रीमिंग और 8 MB P2P पाइपलाइन से भेजी जाती है, जिससे 3-4 GB फाइल पर भी फोन हैंग नहीं होता।',
     howStep3Title: '03. वेरिफाइड डिलीवरी',
     howStep3Body: 'सीधे डिवाइस-टू-डिवाइस (WebRTC P2P) ट्रांसफर होता है और CRC-32 चेकसम से वेरिफाई होता है। कोई भी फाइल या डेटा किसी डेटाबेस या सर्वर में सेव नहीं होता।',
     statusWaiting: 'दूसरे डिवाइस पर Accept करने का इंतज़ार है...',
@@ -246,5 +253,9 @@ export const COPY: Record<
     statusDeclined: 'रिसीवर ने मना किया',
     statusCancelled: 'रद्द किया गया',
     statusError: 'त्रुटि',
+    transportP2P: 'Direct Wi-Fi / LAN P2P',
+    transportRelay: 'Internet Relay',
+    slowLargeFileTip:
+      'तेज़ स्पीड टिप (3+ GB वीडियो): दोनों फोन को एक ही Wi-Fi से जोड़ें (या एक फोन का Mobile Hotspot चालू करके दूसरे को उससे कनेक्ट करें) — इससे मोबाइल डेटा/Relay के बजाय 20–80 MB/s फुल Wi-Fi स्पीड मिलेगी।',
   },
 };

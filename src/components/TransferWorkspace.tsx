@@ -20,6 +20,7 @@ import {
   Tablet,
   Trash2,
   Upload,
+  Wifi,
   X,
 } from 'lucide-react';
 import { FileCategory, Language, PeerConnectionState, PeerInfo, TransferRecord } from '../types/transfer';
@@ -584,7 +585,7 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
                           )}
                           <span aria-hidden="true">·</span>
                           <span>
-                            {rec.transport === 'webrtc-p2p' ? 'Direct P2P' : 'Relay'}
+                            {rec.transport === 'webrtc-p2p' ? t.transportP2P : t.transportRelay}
                           </span>
                         </div>
                       </div>
@@ -665,6 +666,15 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
                       {pct}%
                     </span>
                   </div>
+
+                  {rec.status === 'transferring' &&
+                    rec.fileSize >= 100 * 1024 * 1024 &&
+                    (rec.transport === 'ws-relay' || (rec.speedBps > 0 && rec.speedBps < 2 * 1024 * 1024)) && (
+                      <div className="mt-1 px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/70 text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2">
+                        <Wifi className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
+                        <span>{t.slowLargeFileTip}</span>
+                      </div>
+                    )}
                 </div>
               );
             })}
