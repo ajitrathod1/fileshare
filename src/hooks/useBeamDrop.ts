@@ -13,18 +13,58 @@ import {
   detectDeviceInfo,
   getFileCategory,
 } from '../utils/crc32';
+import { MqttWssClient } from '../utils/mqttSignaling';
 
 const CHUNK_SIZE = 64 * 1024; // 64 KB — universally safe for WebRTC SCTP on iOS Safari, Android Chrome, and Desktop
+const MQTT_RELAY_CHUNK_SIZE = 32 * 1024; // 32 KB when relaying over MQTT WSS fallback
 const DC_HIGH_WATER_MARK = 1024 * 1024; // 1 MB
 const DC_LOW_WATER_THRESHOLD = 256 * 1024; // 256 KB
-const WEBRTC_CONNECT_TIMEOUT_MS = 3500;
+const WEBRTC_CONNECT_TIMEOUT_MS = 4500;
+const MQTT_NS = 'beamdrop_p2p_v1';
 
 const ICE_SERVERS: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
   ],
 };
+
+function generateSixDigitCode(): string {
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const arr = new Uint32Array(1);
+    crypto.getRandomValues(arr);
+    return String(100000 + (arr[0] % 900000));
+  }
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function generateClientPeerId(): string {
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const arr = new Uint8Array(6);
+    crypto.getRandomValues(arr);
+    return Array.from(arr, (b) => b.toString(16).padStart(2, '0')).join('');
+  }
+  return Math.random().toString(36).slice(2, 12);
+}
+
+function getInitialRoomCode(): string {
+  if (typeof window === 'undefined') return '100000';
+  const urlRoom = new URLSearchParams(window.location.search)
+    .get('room')
+    ?.replace(/\D/g, '')
+    .slice(0, 6);
+  if (urlRoom && urlRoom.length === 6) return urlRoom;
+  try {
+    const saved = sessionStorage.getItem('beamdrop_room_code');
+    if (saved && /^\d{6}$/.test(saved)) return saved;
+    const fresh = generateSixDigitCode();
+    sessionStorage.setItem('beamdrop_room_code', fresh);
+    return fresh;
+  } catch {
+    return generateSixDigitCode();
+  }
+}
 
 interface ActiveReceiveState {
   transferId: string;
@@ -53,6 +93,11 @@ interface PendingOutgoingBatch {
   batchId: string;
   targetPeer: PeerInfo;
   files: { manifest: FileManifestItem; file: File }[];
+}
+
+interface MqttPeerEntry extends PeerInfo {
+  roomCode?: string;
+  lastSeen: number;
 }
 
 function encodeDataChunk(transferId: string, chunkIndex: number, payload: Uint8Array): Uint8Array {
@@ -101,10 +146,13 @@ function triggerBrowserDownload(blobUrl: string, fileName: string) {
 
 export function useBeamDrop() {
   const initialDevice = useMemo(() => detectDeviceInfo(), []);
+  const initialRoomCode = useMemo(() => getInitialRoomCode(), []);
+  const initialPeerId = useMemo(() => generateClientPeerId(), []);
 
   const [wsConnected, setWsConnected] = useState(false);
-  const [myPeerId, setMyPeerId] = useState<string | null>(null);
-  const [roomCode, setRoomCode] = useState<string>('');
+  const [signalingBackend, setSignalingBackend] = useState<'ws' | 'mqtt'>('ws');
+  const [myPeerId, setMyPeerId] = useState<string>(initialPeerId);
+  const [roomCode, setRoomCodeState] = useState<string>(initialRoomCode);
   const [deviceName, setDeviceNameState] = useState<string>(initialDevice.name);
   const [nearbyPeers, setNearbyPeers] = useState<PeerInfo[]>([]);
   const [roomPeers, setRoomPeers] = useState<PeerInfo[]>([]);
@@ -119,12 +167,18 @@ export function useBeamDrop() {
   const [roomError, setRoomError] = useState<string | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
-  const myPeerIdRef = useRef<string | null>(null);
+  const mqttRef = useRef<MqttWssClient | null>(null);
+  const broadcastRef = useRef<BroadcastChannel | null>(null);
+  const backendRef = useRef<'ws' | 'mqtt'>('ws');
+
+  const myPeerIdRef = useRef<string>(initialPeerId);
+  const roomCodeRef = useRef<string>(initialRoomCode);
   const deviceNameRef = useRef<string>(initialDevice.name);
   const autoAcceptRef = useRef<boolean>(false);
   const autoDownloadRef = useRef<boolean>(true);
   const reconnectTimerRef = useRef<number | null>(null);
   const heartbeatTimerRef = useRef<number | null>(null);
+  const mqttDirectoryRef = useRef<Map<string, MqttPeerEntry>>(new Map());
 
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const dataChannelsRef = useRef<Map<string, RTCDataChannel>>(new Map());
@@ -142,14 +196,112 @@ export function useBeamDrop() {
     autoDownloadRef.current = autoDownload;
   }, [autoDownload]);
 
-  const sendWsJson = useCallback((payload: unknown) => {
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(payload));
-      return true;
+  const setRoomCode = useCallback((code: string) => {
+    roomCodeRef.current = code;
+    setRoomCodeState(code);
+    try {
+      sessionStorage.setItem('beamdrop_room_code', code);
+    } catch {
+      // ignore storage errors
     }
-    return false;
   }, []);
+
+  const getMySelfPeer = useCallback(
+    (): PeerInfo => ({
+      id: myPeerIdRef.current,
+      name: deviceNameRef.current || initialDevice.name,
+      deviceType: initialDevice.deviceType,
+      os: initialDevice.os,
+      browser: initialDevice.browser,
+      sameNetwork: false,
+    }),
+    [initialDevice]
+  );
+
+  const publishMqttPresence = useCallback(
+    (offline = false) => {
+      const payload = offline
+        ? { id: myPeerIdRef.current, offline: true, ts: Date.now() }
+        : {
+            ...getMySelfPeer(),
+            roomCode: roomCodeRef.current,
+            ts: Date.now(),
+          };
+      const mqtt = mqttRef.current;
+      if (mqtt && mqtt.isConnected()) {
+        mqtt.publishJson(`${MQTT_NS}/lobby/${myPeerIdRef.current}`, payload);
+      }
+      if (broadcastRef.current) {
+        try {
+          broadcastRef.current.postMessage({ kind: 'presence', payload });
+        } catch {
+          // ignore
+        }
+      }
+    },
+    [getMySelfPeer]
+  );
+
+  const syncMqttPeerLists = useCallback(() => {
+    const now = Date.now();
+    const dir = mqttDirectoryRef.current;
+    for (const [id, entry] of dir.entries()) {
+      if (now - entry.lastSeen > 12000) {
+        dir.delete(id);
+      }
+    }
+    const list = Array.from(dir.values()).filter((p) => p.id !== myPeerIdRef.current);
+    setAvailablePeers(list.map((p) => ({ ...p, scope: 'available' })));
+    const matchingRoom = list
+      .filter((p) => p.roomCode && p.roomCode === roomCodeRef.current)
+      .map((p) => ({ ...p, scope: 'pair' as const }));
+    setRoomPeers(matchingRoom);
+    setConnectedPeers((prev) =>
+      prev
+        .map((cp) => {
+          const fresh = list.find((item) => item.id === cp.id);
+          return fresh ? { ...cp, ...fresh } : cp;
+        })
+        .filter((cp) => list.some((item) => item.id === cp.id))
+    );
+  }, []);
+
+  const sendWsJson = useCallback(
+    (payload: Record<string, unknown>) => {
+      if (backendRef.current === 'ws') {
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(payload));
+          return true;
+        }
+        return false;
+      }
+
+      // Serverless / Vercel client-side signaling over MQTT WSS + BroadcastChannel
+      const targetId = typeof payload.targetId === 'string' ? payload.targetId : '';
+      if (!targetId) return false;
+
+      const envelope = {
+        ...payload,
+        from: myPeerIdRef.current,
+        fromPeer: getMySelfPeer(),
+      };
+
+      const mqtt = mqttRef.current;
+      if (mqtt && mqtt.isConnected()) {
+        mqtt.publishJson(`${MQTT_NS}/inbox/${targetId}`, envelope);
+      }
+      if (broadcastRef.current) {
+        try {
+          broadcastRef.current.postMessage({ kind: 'inbox', targetId, envelope });
+        } catch {
+          // ignore
+        }
+      }
+      return Boolean((mqtt && mqtt.isConnected()) || broadcastRef.current);
+    },
+    [getMySelfPeer]
+  );
 
   const updateTransfer = useCallback((transferId: string, patch: Partial<TransferRecord>) => {
     setTransfers((prev) =>
@@ -164,7 +316,9 @@ export function useBeamDrop() {
       const crcMatch = actualCrc === expectedCrc;
       const verified = sizeMatch && crcMatch;
 
-      const blobParts = state.chunks.map((c) => c.buffer.slice(c.byteOffset, c.byteOffset + c.byteLength) as ArrayBuffer);
+      const blobParts = state.chunks.map(
+        (c) => c.buffer.slice(c.byteOffset, c.byteOffset + c.byteLength) as ArrayBuffer
+      );
       const blob = new Blob(blobParts, { type: state.mimeType || 'application/octet-stream' });
       const blobUrl = URL.createObjectURL(blob);
 
@@ -390,6 +544,7 @@ export function useBeamDrop() {
 
       const dc = await waitForDataChannelOrFallback(targetId);
       const transport: TransportMode = dc && dc.readyState === 'open' ? 'webrtc-p2p' : 'ws-relay';
+      const chunkStep = transport === 'webrtc-p2p' ? CHUNK_SIZE : backendRef.current === 'mqtt' ? MQTT_RELAY_CHUNK_SIZE : CHUNK_SIZE;
 
       for (const { manifest, file } of filesToSend) {
         const transferId = manifest.transferId;
@@ -418,7 +573,7 @@ export function useBeamDrop() {
               break;
             }
 
-            const end = Math.min(offset + CHUNK_SIZE, file.size);
+            const end = Math.min(offset + chunkStep, file.size);
             const sliceBuffer = await file.slice(offset, end).arrayBuffer();
             const chunkBytes = new Uint8Array(sliceBuffer);
             crc.update(chunkBytes);
@@ -443,7 +598,7 @@ export function useBeamDrop() {
                 });
               }
               liveDc.send(dataFrame.buffer as ArrayBuffer);
-            } else {
+            } else if (backendRef.current === 'ws') {
               activeTransport = 'ws-relay';
               const ws = wsRef.current;
               if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -454,6 +609,23 @@ export function useBeamDrop() {
               }
               const relayPacket = encodeWsRelayChunk(targetId, dataFrame);
               ws.send(relayPacket.buffer as ArrayBuffer);
+            } else {
+              activeTransport = 'ws-relay';
+              const mqtt = mqttRef.current;
+              if (mqtt && mqtt.isConnected()) {
+                while (mqtt.getBufferedAmount() > 1024 * 1024) {
+                  await new Promise((r) => setTimeout(r, 20));
+                }
+                mqtt.publishBytes(`${MQTT_NS}/bin/${targetId}`, dataFrame);
+              } else if (broadcastRef.current) {
+                broadcastRef.current.postMessage({
+                  kind: 'bin',
+                  targetId,
+                  buffer: dataFrame.buffer.slice(0),
+                });
+              } else {
+                throw new Error('P2P & relay channel unavailable.');
+              }
             }
 
             offset = end;
@@ -585,19 +757,365 @@ export function useBeamDrop() {
     [sendWsJson]
   );
 
+  const handleSignalingMessage = useCallback(
+    async (msg: Record<string, unknown>) => {
+      const type = String(msg.type || '');
+
+      if (type === 'session:init') {
+        const id = String(msg.peerId || '');
+        if (id) {
+          myPeerIdRef.current = id;
+          setMyPeerId(id);
+        }
+        if (typeof msg.roomCode === 'string' && /^\d{6}$/.test(msg.roomCode)) {
+          // Keep URL ?room= code if user opened a QR scan link
+          const urlRoom = new URLSearchParams(window.location.search)
+            .get('room')
+            ?.replace(/\D/g, '')
+            .slice(0, 6);
+          if (!urlRoom || urlRoom.length !== 6) {
+            setRoomCode(msg.roomCode);
+          }
+        }
+        return;
+      }
+
+      if (type === 'room:joined' && typeof msg.roomCode === 'string') {
+        setRoomCode(msg.roomCode);
+        setRoomError(null);
+        return;
+      }
+
+      if (type === 'room:error' && typeof msg.message === 'string') {
+        setRoomError(msg.message);
+        return;
+      }
+
+      if (type === 'peers:update') {
+        const list = Array.isArray(msg.peers) ? (msg.peers as PeerInfo[]) : [];
+        if (msg.scope === 'nearby') {
+          setNearbyPeers(list.map((p) => ({ ...p, scope: 'nearby' })));
+        } else if (msg.scope === 'pair') {
+          setRoomPeers(list.map((p) => ({ ...p, scope: 'pair' })));
+        } else if (msg.scope === 'available') {
+          setAvailablePeers(list.map((p) => ({ ...p, scope: 'available' })));
+          setConnectedPeers((prev) =>
+            prev
+              .map((cp) => {
+                const fresh = list.find((item) => item.id === cp.id);
+                return fresh ? { ...cp, ...fresh } : cp;
+              })
+              .filter((cp) => list.some((item) => item.id === cp.id))
+          );
+        }
+        return;
+      }
+
+      const fromId = typeof msg.from === 'string' ? msg.from : '';
+
+      if (type === 'connect:request' && msg.fromPeer) {
+        const fromPeer = msg.fromPeer as PeerInfo;
+        setIncomingConnectRequests((prev) => {
+          if (prev.some((r) => r.fromPeer.id === fromPeer.id)) return prev;
+          return [
+            ...prev,
+            {
+              requestId: `creq-${Date.now()}-${fromPeer.id}`,
+              fromPeer,
+              createdAt: Date.now(),
+            },
+          ];
+        });
+        return;
+      }
+
+      if (type === 'connect:established' && msg.peer) {
+        const peer = msg.peer as PeerInfo;
+        setConnectedPeers((prev) => {
+          if (prev.some((p) => p.id === peer.id)) {
+            return prev.map((p) => (p.id === peer.id ? peer : p));
+          }
+          return [peer, ...prev];
+        });
+        setConnectionStates((prev) => ({ ...prev, [peer.id]: 'connected' }));
+        return;
+      }
+
+      if (type === 'connect:skip' && fromId) {
+        setConnectionStates((prev) => ({ ...prev, [fromId]: 'skipped' }));
+        return;
+      }
+
+      if (type === 'connect:disconnected' && typeof msg.peerId === 'string') {
+        const deadId = msg.peerId;
+        setConnectedPeers((prev) => prev.filter((p) => p.id !== deadId));
+        setConnectionStates((prev) => ({ ...prev, [deadId]: 'idle' }));
+        return;
+      }
+
+      if (type === 'webrtc:offer' && fromId && msg.sdp) {
+        const pc = createPeerConnection(fromId, false);
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
+        const queued = pendingIceRef.current.get(fromId) || [];
+        for (const cand of queued) {
+          await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+        }
+        pendingIceRef.current.delete(fromId);
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        sendWsJson({
+          type: 'webrtc:answer',
+          targetId: fromId,
+          sdp: pc.localDescription,
+        });
+        return;
+      }
+
+      if (type === 'webrtc:answer' && fromId && msg.sdp) {
+        const pc = peerConnectionsRef.current.get(fromId);
+        if (pc) {
+          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
+          const queued = pendingIceRef.current.get(fromId) || [];
+          for (const cand of queued) {
+            await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+          }
+          pendingIceRef.current.delete(fromId);
+        }
+        return;
+      }
+
+      if (type === 'webrtc:ice' && fromId && msg.candidate) {
+        const pc = peerConnectionsRef.current.get(fromId);
+        if (pc && pc.remoteDescription) {
+          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit)).catch(() => {});
+        } else {
+          const list = pendingIceRef.current.get(fromId) || [];
+          list.push(msg.candidate as RTCIceCandidateInit);
+          pendingIceRef.current.set(fromId, list);
+        }
+        return;
+      }
+
+      if (type === 'transfer:offer' && msg.fromPeer && Array.isArray(msg.files)) {
+        const files = msg.files as FileManifestItem[];
+        const batch: IncomingOfferBatch = {
+          batchId: String(msg.batchId),
+          fromPeer: msg.fromPeer as PeerInfo,
+          files,
+          totalSize: files.reduce((acc, f) => acc + f.size, 0),
+          createdAt: Date.now(),
+        };
+        if (autoAcceptRef.current) {
+          acceptOfferBatch(batch);
+        } else {
+          setIncomingOffers((prev) => [...prev, batch]);
+        }
+        return;
+      }
+
+      if (type === 'transfer:accept') {
+        const batchId = String(msg.batchId || '');
+        const acceptedIds = Array.isArray(msg.acceptedIds) ? (msg.acceptedIds as string[]) : [];
+        const batch = outgoingBatchesRef.current.get(batchId);
+        if (batch) {
+          executeOutgoingBatch(batch, acceptedIds);
+        }
+        return;
+      }
+
+      if (type === 'transfer:decline') {
+        const batchId = String(msg.batchId || '');
+        const batch = outgoingBatchesRef.current.get(batchId);
+        if (batch) {
+          for (const f of batch.files) {
+            updateTransfer(f.manifest.transferId, { status: 'declined' });
+          }
+          outgoingBatchesRef.current.delete(batchId);
+        }
+        return;
+      }
+
+      if (type === 'transfer:complete') {
+        const transferId = String(msg.transferId || '');
+        const totalBytes = Number(msg.totalBytes || 0);
+        const crc32 = String(msg.crc32 || '');
+        const state = receivingRef.current.get(transferId);
+        if (state) {
+          if (state.receivedBytes >= totalBytes) {
+            finalizeReceive(state, totalBytes, crc32);
+          } else {
+            state.pendingCompletion = { totalBytes, crc32 };
+          }
+        }
+        return;
+      }
+
+      if (type === 'transfer:ack') {
+        const transferId = String(msg.transferId || '');
+        const verified = Boolean(msg.verified);
+        const ackCrc = typeof msg.crc32 === 'string' ? msg.crc32 : undefined;
+        updateTransfer(transferId, {
+          status: verified ? 'completed' : 'error',
+          verifiedLossless: verified,
+          crc32Actual: ackCrc,
+          completedAt: Date.now(),
+          errorMessage: verified ? undefined : 'Receiver checksum verification failed',
+        });
+        return;
+      }
+
+      if (type === 'transfer:cancel') {
+        const transferId = String(msg.transferId || '');
+        cancelledTransfersRef.current.add(transferId);
+        const state = receivingRef.current.get(transferId);
+        if (state) {
+          state.chunks = [];
+          receivingRef.current.delete(transferId);
+        }
+        updateTransfer(transferId, { status: 'cancelled' });
+      }
+    },
+    [
+      acceptOfferBatch,
+      createPeerConnection,
+      executeOutgoingBatch,
+      finalizeReceive,
+      sendWsJson,
+      setRoomCode,
+      updateTransfer,
+    ]
+  );
+
   useEffect(() => {
     let unmounted = false;
+    let everOpenedWs = false;
+    let presenceInterval: number | null = null;
+    let pruneInterval: number | null = null;
 
-    const connect = () => {
+    const startServerlessMqtt = () => {
+      if (unmounted || mqttRef.current) return;
+      backendRef.current = 'mqtt';
+      setSignalingBackend('mqtt');
+
+      if (typeof BroadcastChannel !== 'undefined' && !broadcastRef.current) {
+        const bc = new BroadcastChannel('beamdrop_local');
+        broadcastRef.current = bc;
+        bc.onmessage = (e) => {
+          const data = e.data;
+          if (!data) return;
+          if (data.kind === 'presence' && data.payload?.id && data.payload.id !== myPeerIdRef.current) {
+            if (data.payload.offline) {
+              mqttDirectoryRef.current.delete(data.payload.id);
+            } else {
+              mqttDirectoryRef.current.set(data.payload.id, {
+                ...data.payload,
+                sameNetwork: true,
+                lastSeen: Date.now(),
+              });
+            }
+            syncMqttPeerLists();
+          } else if (data.kind === 'inbox' && data.targetId === myPeerIdRef.current && data.envelope) {
+            handleSignalingMessage(data.envelope);
+          } else if (data.kind === 'bin' && data.targetId === myPeerIdRef.current && data.buffer) {
+            handleIncomingBinaryFrame(data.buffer, 'ws-relay');
+          }
+        };
+      }
+
+      const mqtt = new MqttWssClient(`bd_${myPeerIdRef.current}`);
+      mqttRef.current = mqtt;
+
+      mqtt.onConnect = () => {
+        if (unmounted) return;
+        setWsConnected(true);
+        publishMqttPresence(false);
+        if (presenceInterval) clearInterval(presenceInterval);
+        presenceInterval = window.setInterval(() => publishMqttPresence(false), 3500);
+        if (pruneInterval) clearInterval(pruneInterval);
+        pruneInterval = window.setInterval(syncMqttPeerLists, 3000);
+      };
+
+      mqtt.onDisconnect = () => {
+        if (!unmounted) setWsConnected(false);
+      };
+
+      mqtt.onMessage = (topic, payload) => {
+        if (topic.startsWith(`${MQTT_NS}/bin/`)) {
+          const copy = new Uint8Array(payload.length);
+          copy.set(payload);
+          handleIncomingBinaryFrame(copy.buffer, 'ws-relay');
+          return;
+        }
+
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(new TextDecoder().decode(payload));
+        } catch {
+          return;
+        }
+
+        if (topic.startsWith(`${MQTT_NS}/lobby/`)) {
+          const id = String(parsed.id || '');
+          if (!id || id === myPeerIdRef.current) return;
+          if (parsed.offline) {
+            mqttDirectoryRef.current.delete(id);
+          } else {
+            mqttDirectoryRef.current.set(id, {
+              id,
+              name: String(parsed.name || 'Device'),
+              deviceType:
+                parsed.deviceType === 'phone' || parsed.deviceType === 'tablet'
+                  ? parsed.deviceType
+                  : 'desktop',
+              os: String(parsed.os || 'Device'),
+              browser: String(parsed.browser || 'Browser'),
+              roomCode: typeof parsed.roomCode === 'string' ? parsed.roomCode : undefined,
+              sameNetwork: false,
+              lastSeen: Date.now(),
+            });
+          }
+          syncMqttPeerLists();
+          return;
+        }
+
+        if (topic === `${MQTT_NS}/inbox/${myPeerIdRef.current}`) {
+          handleSignalingMessage(parsed);
+        }
+      };
+
+      mqtt.connect([
+        `${MQTT_NS}/lobby/+`,
+        `${MQTT_NS}/inbox/${myPeerIdRef.current}`,
+        `${MQTT_NS}/bin/${myPeerIdRef.current}`,
+      ]);
+    };
+
+    const connectWs = () => {
       if (unmounted) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+      } catch {
+        startServerlessMqtt();
+        return;
+      }
       ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
 
+      const wsTimeout = window.setTimeout(() => {
+        if (!everOpenedWs && ws.readyState !== WebSocket.OPEN) {
+          ws.close();
+          startServerlessMqtt();
+        }
+      }, 1800);
+
       ws.onopen = () => {
+        clearTimeout(wsTimeout);
+        everOpenedWs = true;
+        backendRef.current = 'ws';
+        setSignalingBackend('ws');
         setWsConnected(true);
-        const urlRoom = new URLSearchParams(window.location.search).get('room')?.replace(/\D/g, '').slice(0, 6);
         const info = detectDeviceInfo();
         ws.send(
           JSON.stringify({
@@ -606,7 +1124,7 @@ export function useBeamDrop() {
             deviceType: info.deviceType,
             os: info.os,
             browser: info.browser,
-            requestedRoomCode: urlRoom && urlRoom.length === 6 ? urlRoom : undefined,
+            requestedRoomCode: roomCodeRef.current,
           })
         );
 
@@ -619,253 +1137,63 @@ export function useBeamDrop() {
       };
 
       ws.onclose = () => {
+        clearTimeout(wsTimeout);
         setWsConnected(false);
         if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
-        if (!unmounted) {
-          reconnectTimerRef.current = window.setTimeout(connect, 1800);
+        if (unmounted) return;
+
+        if (!everOpenedWs) {
+          // Hosted on Vercel / static CDN without /ws server -> switch immediately to serverless client-side signaling
+          startServerlessMqtt();
+        } else {
+          reconnectTimerRef.current = window.setTimeout(connectWs, 1800);
         }
       };
 
-      ws.onmessage = async (event) => {
+      ws.onmessage = (event) => {
         if (event.data instanceof ArrayBuffer) {
           handleIncomingBinaryFrame(event.data, 'ws-relay');
           return;
         }
-
         let msg: Record<string, unknown>;
         try {
           msg = JSON.parse(String(event.data));
         } catch {
           return;
         }
-
-        const type = String(msg.type || '');
-
-        if (type === 'session:init') {
-          const id = String(msg.peerId || '');
-          myPeerIdRef.current = id;
-          setMyPeerId(id);
-          if (typeof msg.roomCode === 'string') {
-            setRoomCode(msg.roomCode);
-          }
-          return;
-        }
-
-        if (type === 'room:joined' && typeof msg.roomCode === 'string') {
-          setRoomCode(msg.roomCode);
-          setRoomError(null);
-          return;
-        }
-
-        if (type === 'room:error' && typeof msg.message === 'string') {
-          setRoomError(msg.message);
-          return;
-        }
-
-        if (type === 'peers:update') {
-          const list = Array.isArray(msg.peers) ? (msg.peers as PeerInfo[]) : [];
-          if (msg.scope === 'nearby') {
-            setNearbyPeers(list.map((p) => ({ ...p, scope: 'nearby' })));
-          } else if (msg.scope === 'pair') {
-            setRoomPeers(list.map((p) => ({ ...p, scope: 'pair' })));
-          } else if (msg.scope === 'available') {
-            setAvailablePeers(list.map((p) => ({ ...p, scope: 'available' })));
-            // Sync names for already connected peers
-            setConnectedPeers((prev) =>
-              prev
-                .map((cp) => {
-                  const fresh = list.find((item) => item.id === cp.id);
-                  return fresh ? { ...cp, ...fresh } : cp;
-                })
-                .filter((cp) => list.some((item) => item.id === cp.id))
-            );
-          }
-          return;
-        }
-
-        const fromId = typeof msg.from === 'string' ? msg.from : '';
-
-        if (type === 'connect:request' && msg.fromPeer) {
-          const fromPeer = msg.fromPeer as PeerInfo;
-          setIncomingConnectRequests((prev) => {
-            if (prev.some((r) => r.fromPeer.id === fromPeer.id)) return prev;
-            return [
-              ...prev,
-              {
-                requestId: `creq-${Date.now()}-${fromPeer.id}`,
-                fromPeer,
-                createdAt: Date.now(),
-              },
-            ];
-          });
-          return;
-        }
-
-        if (type === 'connect:established' && msg.peer) {
-          const peer = msg.peer as PeerInfo;
-          setConnectedPeers((prev) => {
-            if (prev.some((p) => p.id === peer.id)) {
-              return prev.map((p) => (p.id === peer.id ? peer : p));
-            }
-            return [peer, ...prev];
-          });
-          setConnectionStates((prev) => ({ ...prev, [peer.id]: 'connected' }));
-          return;
-        }
-
-        if (type === 'connect:skip' && fromId) {
-          setConnectionStates((prev) => ({ ...prev, [fromId]: 'skipped' }));
-          return;
-        }
-
-        if (type === 'connect:disconnected' && typeof msg.peerId === 'string') {
-          const deadId = msg.peerId;
-          setConnectedPeers((prev) => prev.filter((p) => p.id !== deadId));
-          setConnectionStates((prev) => ({ ...prev, [deadId]: 'idle' }));
-          return;
-        }
-
-        if (type === 'webrtc:offer' && fromId && msg.sdp) {
-          const pc = createPeerConnection(fromId, false);
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
-          const queued = pendingIceRef.current.get(fromId) || [];
-          for (const cand of queued) {
-            await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-          }
-          pendingIceRef.current.delete(fromId);
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          sendWsJson({
-            type: 'webrtc:answer',
-            targetId: fromId,
-            sdp: pc.localDescription,
-          });
-          return;
-        }
-
-        if (type === 'webrtc:answer' && fromId && msg.sdp) {
-          const pc = peerConnectionsRef.current.get(fromId);
-          if (pc) {
-            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp as RTCSessionDescriptionInit));
-            const queued = pendingIceRef.current.get(fromId) || [];
-            for (const cand of queued) {
-              await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
-            }
-            pendingIceRef.current.delete(fromId);
-          }
-          return;
-        }
-
-        if (type === 'webrtc:ice' && fromId && msg.candidate) {
-          const pc = peerConnectionsRef.current.get(fromId);
-          if (pc && pc.remoteDescription) {
-            await pc.addIceCandidate(new RTCIceCandidate(msg.candidate as RTCIceCandidateInit)).catch(() => {});
-          } else {
-            const list = pendingIceRef.current.get(fromId) || [];
-            list.push(msg.candidate as RTCIceCandidateInit);
-            pendingIceRef.current.set(fromId, list);
-          }
-          return;
-        }
-
-        if (type === 'transfer:offer' && msg.fromPeer && Array.isArray(msg.files)) {
-          const files = msg.files as FileManifestItem[];
-          const batch: IncomingOfferBatch = {
-            batchId: String(msg.batchId),
-            fromPeer: msg.fromPeer as PeerInfo,
-            files,
-            totalSize: files.reduce((acc, f) => acc + f.size, 0),
-            createdAt: Date.now(),
-          };
-          if (autoAcceptRef.current) {
-            acceptOfferBatch(batch);
-          } else {
-            setIncomingOffers((prev) => [...prev, batch]);
-          }
-          return;
-        }
-
-        if (type === 'transfer:accept') {
-          const batchId = String(msg.batchId || '');
-          const acceptedIds = Array.isArray(msg.acceptedIds) ? (msg.acceptedIds as string[]) : [];
-          const batch = outgoingBatchesRef.current.get(batchId);
-          if (batch) {
-            executeOutgoingBatch(batch, acceptedIds);
-          }
-          return;
-        }
-
-        if (type === 'transfer:decline') {
-          const batchId = String(msg.batchId || '');
-          const batch = outgoingBatchesRef.current.get(batchId);
-          if (batch) {
-            for (const f of batch.files) {
-              updateTransfer(f.manifest.transferId, { status: 'declined' });
-            }
-            outgoingBatchesRef.current.delete(batchId);
-          }
-          return;
-        }
-
-        if (type === 'transfer:complete') {
-          const transferId = String(msg.transferId || '');
-          const totalBytes = Number(msg.totalBytes || 0);
-          const crc32 = String(msg.crc32 || '');
-          const state = receivingRef.current.get(transferId);
-          if (state) {
-            if (state.receivedBytes >= totalBytes) {
-              finalizeReceive(state, totalBytes, crc32);
-            } else {
-              state.pendingCompletion = { totalBytes, crc32 };
-            }
-          }
-          return;
-        }
-
-        if (type === 'transfer:ack') {
-          const transferId = String(msg.transferId || '');
-          const verified = Boolean(msg.verified);
-          const ackCrc = typeof msg.crc32 === 'string' ? msg.crc32 : undefined;
-          updateTransfer(transferId, {
-            status: verified ? 'completed' : 'error',
-            verifiedLossless: verified,
-            crc32Actual: ackCrc,
-            completedAt: Date.now(),
-            errorMessage: verified ? undefined : 'Receiver checksum verification failed',
-          });
-          return;
-        }
-
-        if (type === 'transfer:cancel') {
-          const transferId = String(msg.transferId || '');
-          cancelledTransfersRef.current.add(transferId);
-          const state = receivingRef.current.get(transferId);
-          if (state) {
-            state.chunks = [];
-            receivingRef.current.delete(transferId);
-          }
-          updateTransfer(transferId, { status: 'cancelled' });
-        }
+        handleSignalingMessage(msg);
       };
     };
 
-    connect();
+    const handleBeforeUnload = () => {
+      if (backendRef.current === 'mqtt') {
+        publishMqttPresence(true);
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+
+    connectWs();
 
     return () => {
       unmounted = true;
+      window.removeEventListener('beforeunload', handleBeforeUnload);
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+      if (presenceInterval) clearInterval(presenceInterval);
+      if (pruneInterval) clearInterval(pruneInterval);
       wsRef.current?.close();
+      if (mqttRef.current) {
+        publishMqttPresence(true);
+        mqttRef.current.close();
+      }
+      broadcastRef.current?.close();
       peerConnectionsRef.current.forEach((pc) => pc.close());
     };
   }, [
-    acceptOfferBatch,
-    createPeerConnection,
-    executeOutgoingBatch,
-    finalizeReceive,
     handleIncomingBinaryFrame,
-    sendWsJson,
-    updateTransfer,
+    handleSignalingMessage,
+    publishMqttPresence,
+    syncMqttPeerLists,
   ]);
 
   const updateDeviceName = useCallback(
@@ -879,16 +1207,20 @@ export function useBeamDrop() {
       } catch {
         // ignore storage errors
       }
-      const info = detectDeviceInfo();
-      sendWsJson({
-        type: 'peer:register',
-        name: clean,
-        deviceType: info.deviceType,
-        os: info.os,
-        browser: info.browser,
-      });
+      if (backendRef.current === 'ws') {
+        const info = detectDeviceInfo();
+        sendWsJson({
+          type: 'peer:register',
+          name: clean,
+          deviceType: info.deviceType,
+          os: info.os,
+          browser: info.browser,
+        });
+      } else {
+        publishMqttPresence(false);
+      }
     },
-    [sendWsJson]
+    [publishMqttPresence, sendWsJson]
   );
 
   const joinRoomCode = useCallback(
@@ -899,16 +1231,31 @@ export function useBeamDrop() {
         return false;
       }
       setRoomError(null);
-      sendWsJson({ type: 'room:join', roomCode: clean });
+      setRoomCode(clean);
+
+      if (backendRef.current === 'ws') {
+        sendWsJson({ type: 'room:join', roomCode: clean });
+      } else {
+        publishMqttPresence(false);
+        syncMqttPeerLists();
+      }
       return true;
     },
-    [sendWsJson]
+    [publishMqttPresence, sendWsJson, setRoomCode, syncMqttPeerLists]
   );
 
   const createNewRoomCode = useCallback(() => {
     setRoomError(null);
-    sendWsJson({ type: 'room:new' });
-  }, [sendWsJson]);
+    const fresh = generateSixDigitCode();
+    setRoomCode(fresh);
+
+    if (backendRef.current === 'ws') {
+      sendWsJson({ type: 'room:join', roomCode: fresh });
+    } else {
+      publishMqttPresence(false);
+      syncMqttPeerLists();
+    }
+  }, [publishMqttPresence, sendWsJson, setRoomCode, syncMqttPeerLists]);
 
   const sendFilesToPeer = useCallback(
     (peer: PeerInfo, files: File[]) => {
@@ -981,11 +1328,23 @@ export function useBeamDrop() {
   const clearCompletedTransfers = useCallback(() => {
     setTransfers((prev) => {
       prev.forEach((t) => {
-        if ((t.status === 'completed' || t.status === 'declined' || t.status === 'cancelled' || t.status === 'error') && t.blobUrl) {
+        if (
+          (t.status === 'completed' ||
+            t.status === 'declined' ||
+            t.status === 'cancelled' ||
+            t.status === 'error') &&
+          t.blobUrl
+        ) {
           URL.revokeObjectURL(t.blobUrl);
         }
       });
-      return prev.filter((t) => t.status === 'transferring' || t.status === 'connecting' || t.status === 'waiting-accept' || t.status === 'verifying');
+      return prev.filter(
+        (t) =>
+          t.status === 'transferring' ||
+          t.status === 'connecting' ||
+          t.status === 'waiting-accept' ||
+          t.status === 'verifying'
+      );
     });
   }, []);
 
@@ -1003,12 +1362,25 @@ export function useBeamDrop() {
   const acceptConnectionRequest = useCallback(
     (req: IncomingConnectionRequest) => {
       setIncomingConnectRequests((prev) => prev.filter((item) => item.requestId !== req.requestId));
-      sendWsJson({
-        type: 'connect:accept',
-        targetId: req.fromPeer.id,
-      });
+      if (backendRef.current === 'ws') {
+        sendWsJson({
+          type: 'connect:accept',
+          targetId: req.fromPeer.id,
+        });
+      } else {
+        setConnectedPeers((prev) => {
+          if (prev.some((p) => p.id === req.fromPeer.id)) return prev;
+          return [req.fromPeer, ...prev];
+        });
+        setConnectionStates((prev) => ({ ...prev, [req.fromPeer.id]: 'connected' }));
+        sendWsJson({
+          type: 'connect:established',
+          targetId: req.fromPeer.id,
+          peer: getMySelfPeer(),
+        });
+      }
     },
-    [sendWsJson]
+    [getMySelfPeer, sendWsJson]
   );
 
   const skipConnectionRequest = useCallback(
@@ -1026,10 +1398,18 @@ export function useBeamDrop() {
     (peerId: string) => {
       setConnectedPeers((prev) => prev.filter((p) => p.id !== peerId));
       setConnectionStates((prev) => ({ ...prev, [peerId]: 'idle' }));
-      sendWsJson({
-        type: 'connect:disconnect',
-        targetId: peerId,
-      });
+      if (backendRef.current === 'ws') {
+        sendWsJson({
+          type: 'connect:disconnect',
+          targetId: peerId,
+        });
+      } else {
+        sendWsJson({
+          type: 'connect:disconnected',
+          targetId: peerId,
+          peerId: myPeerIdRef.current,
+        });
+      }
     },
     [sendWsJson]
   );
@@ -1051,6 +1431,7 @@ export function useBeamDrop() {
 
   return {
     wsConnected,
+    signalingBackend,
     myPeerId,
     roomCode,
     deviceName,

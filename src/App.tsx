@@ -72,7 +72,13 @@ export default function App() {
   const [selectedPeerId, setSelectedPeerId] = useState<string | null>(null);
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   const [pairModalOpen, setPairModalOpen] = useState(false);
+  const [pairModalTab, setPairModalTab] = useState<'show' | 'scan'>('show');
   const [previewRecord, setPreviewRecord] = useState<TransferRecord | null>(null);
+
+  const openPairingModal = (tab: 'show' | 'scan' = 'show') => {
+    setPairModalTab(tab);
+    setPairModalOpen(true);
+  };
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
@@ -174,7 +180,7 @@ export default function App() {
           <div className="flex items-center shrink-0">
             <button
               type="button"
-              onClick={() => setPairModalOpen(true)}
+              onClick={() => openPairingModal('show')}
               className="min-h-[40px] px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-xs sm:text-sm font-medium transition-colors inline-flex items-center gap-2 whitespace-nowrap shrink-0"
             >
               <QrCode className="w-4 h-4" />
@@ -309,7 +315,7 @@ export default function App() {
               onSelectPeer={(peer) => setSelectedPeerId(peer.id)}
               onRequestConnect={requestConnection}
               onDisconnectPeer={disconnectPeer}
-              onOpenPairing={() => setPairModalOpen(true)}
+              onOpenPairing={openPairingModal}
               lang={lang}
             />
           </div>
@@ -322,7 +328,7 @@ export default function App() {
               selectedPeer={selectedPeer}
               onSelectPeer={(peer) => setSelectedPeerId(peer.id)}
               onRequestConnect={requestConnection}
-              onOpenPairing={() => setPairModalOpen(true)}
+              onOpenPairing={() => openPairingModal('show')}
               queuedFiles={queuedFiles}
               onAddFiles={handleAddFiles}
               onRemoveQueuedFile={handleRemoveQueuedFile}
@@ -383,7 +389,7 @@ export default function App() {
         <div className="sm:hidden fixed bottom-0 left-0 right-0 z-40 p-3 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800">
           <button
             type="button"
-            onClick={() => (selectedPeer ? handleSendQueue() : setPairModalOpen(true))}
+            onClick={() => (selectedPeer ? handleSendQueue() : openPairingModal('show'))}
             className="w-full h-12 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium flex items-center justify-center gap-2 active:scale-[0.99] transition-transform"
           >
             {selectedPeer ? <Send className="w-4 h-4" /> : <QrCode className="w-4 h-4" />}
@@ -399,6 +405,7 @@ export default function App() {
       {/* Modals */}
       <QrPairModal
         open={pairModalOpen}
+        initialTab={pairModalTab}
         onClose={() => setPairModalOpen(false)}
         roomCode={roomCode}
         roomError={roomError}
