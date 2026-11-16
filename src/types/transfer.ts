@@ -8,7 +8,16 @@ export interface PeerInfo {
   deviceType: DeviceType;
   os: string;
   browser: string;
-  scope?: 'nearby' | 'pair';
+  sameNetwork?: boolean;
+  scope?: 'nearby' | 'pair' | 'available';
+}
+
+export type PeerConnectionState = 'idle' | 'requesting' | 'connected' | 'skipped';
+
+export interface IncomingConnectionRequest {
+  requestId: string;
+  fromPeer: PeerInfo;
+  createdAt: number;
 }
 
 export type FileCategory = 'video' | 'audio' | 'image' | 'archive' | 'document';

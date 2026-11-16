@@ -16,12 +16,14 @@ interface PeerRecord {
   browser: string;
   nearbyRoom: string;
   pairRoom: string | null;
+  discoverable: boolean;
   ws: WebSocket;
   connectedAt: number;
 }
 
 const peers = new Map<string, PeerRecord>();
 const rooms = new Map<string, Set<string>>();
+const peerLinks = new Map<string, Set<string>>();
 
 function normalizeIp(rawIp: string | undefined): string {
   if (!rawIp) return '127.0.0.1';
@@ -55,19 +57,47 @@ function removePeerFromRoom(peerId: string, roomKey: string) {
   }
 }
 
-function serializePeer(peer: PeerRecord) {
+function addPeerLink(a: string, b: string) {
+  if (!peerLinks.has(a)) peerLinks.set(a, new Set());
+  if (!peerLinks.has(b)) peerLinks.set(b, new Set());
+  peerLinks.get(a)!.add(b);
+  peerLinks.get(b)!.add(a);
+}
+
+function removePeerLink(a: string, b: string) {
+  peerLinks.get(a)?.delete(b);
+  peerLinks.get(b)?.delete(a);
+}
+
+function serializePeer(peer: PeerRecord, viewer?: PeerRecord) {
   return {
     id: peer.id,
     name: peer.name,
     deviceType: peer.deviceType,
     os: peer.os,
     browser: peer.browser,
+    sameNetwork: viewer ? peer.nearbyRoom === viewer.nearbyRoom : false,
   };
 }
 
 function sendJson(ws: WebSocket, payload: unknown) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
+  }
+}
+
+function broadcastLobbyPeers() {
+  const all = Array.from(peers.values());
+  for (const recipient of all) {
+    const others = all
+      .filter((m) => m.id !== recipient.id && m.discoverable)
+      .map((m) => serializePeer(m, recipient));
+    sendJson(recipient.ws, {
+      type: 'peers:update',
+      scope: 'available',
+      roomCode: null,
+      peers: others,
+    });
   }
 }
 
@@ -88,7 +118,7 @@ function broadcastRoomPeers(roomKey: string) {
   for (const recipient of members) {
     const others = members
       .filter((m) => m.id !== recipient.id)
-      .map(serializePeer);
+      .map((m) => serializePeer(m, recipient));
     sendJson(recipient.ws, {
       type: 'peers:update',
       scope,
@@ -137,6 +167,7 @@ async function startServer() {
       browser: 'Browser',
       nearbyRoom,
       pairRoom: `pair:${defaultPairCode}`,
+      discoverable: true,
       ws,
       connectedAt: Date.now(),
     };
@@ -153,6 +184,7 @@ async function startServer() {
 
     broadcastRoomPeers(nearbyRoom);
     broadcastRoomPeers(peer.pairRoom!);
+    broadcastLobbyPeers();
 
     ws.on('message', (rawData, isBinary) => {
       if (isBinary) {
@@ -191,6 +223,7 @@ async function startServer() {
         }
         if (typeof msg.os === 'string') peer.os = msg.os.slice(0, 32);
         if (typeof msg.browser === 'string') peer.browser = msg.browser.slice(0, 32);
+        if (typeof msg.discoverable === 'boolean') peer.discoverable = msg.discoverable;
 
         if (typeof msg.requestedRoomCode === 'string' && /^\d{6}$/.test(msg.requestedRoomCode)) {
           if (peer.pairRoom) {
@@ -205,6 +238,7 @@ async function startServer() {
 
         broadcastRoomPeers(peer.nearbyRoom);
         if (peer.pairRoom) broadcastRoomPeers(peer.pairRoom);
+        broadcastLobbyPeers();
         return;
       }
 
@@ -243,25 +277,67 @@ async function startServer() {
       }
 
       const targetId = typeof msg.targetId === 'string' ? msg.targetId : '';
-      if (targetId) {
-        const targetPeer = peers.get(targetId);
-        if (targetPeer && targetPeer.ws.readyState === WebSocket.OPEN) {
-          sendJson(targetPeer.ws, {
-            ...msg,
-            from: peerId,
-            fromPeer: serializePeer(peer),
-          });
-        } else {
-          sendJson(ws, {
-            type: 'peer:unavailable',
-            targetId,
-            transferId: msg.transferId ?? null,
-          });
-        }
+      if (!targetId) return;
+
+      const targetPeer = peers.get(targetId);
+      if (!targetPeer || targetPeer.ws.readyState !== WebSocket.OPEN) {
+        sendJson(ws, {
+          type: 'peer:unavailable',
+          targetId,
+          transferId: msg.transferId ?? null,
+        });
+        return;
       }
+
+      if (type === 'connect:accept') {
+        addPeerLink(peerId, targetId);
+        sendJson(targetPeer.ws, {
+          type: 'connect:established',
+          peer: serializePeer(peer, targetPeer),
+        });
+        sendJson(ws, {
+          type: 'connect:established',
+          peer: serializePeer(targetPeer, peer),
+        });
+        return;
+      }
+
+      if (type === 'connect:disconnect') {
+        removePeerLink(peerId, targetId);
+        sendJson(targetPeer.ws, {
+          type: 'connect:disconnected',
+          peerId,
+        });
+        sendJson(ws, {
+          type: 'connect:disconnected',
+          peerId: targetId,
+        });
+        return;
+      }
+
+      sendJson(targetPeer.ws, {
+        ...msg,
+        from: peerId,
+        fromPeer: serializePeer(peer, targetPeer),
+      });
     });
 
     ws.on('close', () => {
+      const linked = peerLinks.get(peerId);
+      if (linked) {
+        for (const otherId of linked) {
+          const other = peers.get(otherId);
+          peerLinks.get(otherId)?.delete(peerId);
+          if (other && other.ws.readyState === WebSocket.OPEN) {
+            sendJson(other.ws, {
+              type: 'connect:disconnected',
+              peerId,
+            });
+          }
+        }
+        peerLinks.delete(peerId);
+      }
+
       peers.delete(peerId);
       removePeerFromRoom(peerId, peer.nearbyRoom);
       broadcastRoomPeers(peer.nearbyRoom);
@@ -269,6 +345,7 @@ async function startServer() {
         removePeerFromRoom(peerId, peer.pairRoom);
         broadcastRoomPeers(peer.pairRoom);
       }
+      broadcastLobbyPeers();
     });
   });
 

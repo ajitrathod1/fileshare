@@ -3,11 +3,13 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   CheckCircle2,
+  Clock,
   Download,
   File,
   Film,
   Image as ImageIcon,
   Laptop,
+  Link2,
   Music,
   Package,
   Play,
@@ -20,14 +22,17 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import { FileCategory, Language, PeerInfo, TransferRecord } from '../types/transfer';
+import { FileCategory, Language, PeerConnectionState, PeerInfo, TransferRecord } from '../types/transfer';
 import { formatBytes, formatEta, formatSpeed, getFileCategory } from '../utils/crc32';
 import { COPY } from '../utils/i18n';
 
 interface TransferWorkspaceProps {
-  allPeers: PeerInfo[];
+  connectedPeers: PeerInfo[];
+  availablePeers: PeerInfo[];
+  connectionStates: Record<string, PeerConnectionState>;
   selectedPeer: PeerInfo | null;
   onSelectPeer: (peer: PeerInfo) => void;
+  onRequestConnect: (peer: PeerInfo) => void;
   onOpenPairing: () => void;
   queuedFiles: File[];
   onAddFiles: (files: FileList | File[]) => void;
@@ -61,9 +66,12 @@ function PeerSmallIcon({ type }: { type: PeerInfo['deviceType'] }) {
 }
 
 export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
-  allPeers,
+  connectedPeers,
+  availablePeers,
+  connectionStates,
   selectedPeer,
   onSelectPeer,
+  onRequestConnect,
   onOpenPairing,
   queuedFiles,
   onAddFiles,
@@ -160,9 +168,9 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
         <div className="pb-4 border-b border-slate-100 dark:border-slate-800">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs font-medium text-slate-500 dark:text-slate-400">
-              {allPeers.length > 0 ? t.chooseRecipientLabel : t.connectedToLabel}
+              {connectedPeers.length > 0 ? t.chooseRecipientLabel : t.connectedToLabel}
             </span>
-            {allPeers.length === 0 && (
+            {connectedPeers.length === 0 && availablePeers.length === 0 && (
               <button
                 type="button"
                 onClick={onOpenPairing}
@@ -174,13 +182,9 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
             )}
           </div>
 
-          {allPeers.length === 0 ? (
-            <p className="mt-1.5 text-sm font-medium text-slate-600 dark:text-slate-300">
-              {t.noDeviceConnected}
-            </p>
-          ) : (
+          {connectedPeers.length > 0 ? (
             <div className="mt-2.5 flex flex-wrap items-center gap-2">
-              {allPeers.map((peer) => {
+              {connectedPeers.map((peer) => {
                 const isSelected = selectedPeer?.id === peer.id;
                 return (
                   <button
@@ -195,13 +199,48 @@ export const TransferWorkspace: React.FC<TransferWorkspaceProps> = ({
                   >
                     <PeerSmallIcon type={peer.deviceType} />
                     <span>{peer.name}</span>
-                    <span className={isSelected ? 'text-blue-100' : 'text-slate-400'}>
-                      · {peer.scope === 'pair' ? 'Paired' : 'Wi-Fi'}
+                    <span className={isSelected ? 'text-blue-100' : 'text-emerald-600 dark:text-emerald-400'}>
+                      · {t.activeBridgeLabel}
                     </span>
                   </button>
                 );
               })}
             </div>
+          ) : availablePeers.length > 0 ? (
+            <div className="mt-2.5 flex flex-wrap items-center gap-2">
+              {availablePeers.map((peer) => {
+                const state = connectionStates[peer.id] || 'idle';
+                return (
+                  <button
+                    key={peer.id}
+                    type="button"
+                    onClick={() => onRequestConnect(peer)}
+                    disabled={state === 'requesting'}
+                    className="min-h-[40px] px-3.5 py-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:border-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950/40 text-xs sm:text-sm font-medium text-slate-800 dark:text-slate-100 transition-colors inline-flex items-center gap-2 whitespace-nowrap"
+                  >
+                    <PeerSmallIcon type={peer.deviceType} />
+                    <span>{peer.name}</span>
+                    <span className="text-blue-600 dark:text-blue-400 inline-flex items-center gap-1">
+                      {state === 'requesting' ? (
+                        <>
+                          <Clock className="w-3.5 h-3.5" />
+                          <span>{t.waitingBtn}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Link2 className="w-3.5 h-3.5" />
+                          <span>{t.connectBtn}</span>
+                        </>
+                      )}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="mt-1.5 text-sm font-medium text-slate-600 dark:text-slate-300">
+              {t.noDeviceConnected}
+            </p>
           )}
         </div>
 

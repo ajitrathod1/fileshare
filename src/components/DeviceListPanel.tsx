@@ -2,14 +2,17 @@ import React, { useState } from 'react';
 import {
   Check,
   CheckCircle2,
+  Clock,
   Edit3,
   Laptop,
+  Link2,
   QrCode,
   Smartphone,
   Tablet,
+  Unlink,
   Wifi,
 } from 'lucide-react';
-import { Language, PeerInfo } from '../types/transfer';
+import { Language, PeerConnectionState, PeerInfo } from '../types/transfer';
 import { COPY } from '../utils/i18n';
 
 interface DeviceListPanelProps {
@@ -17,10 +20,13 @@ interface DeviceListPanelProps {
   onRenameDevice: (name: string) => void;
   wsConnected: boolean;
   roomCode: string;
-  nearbyPeers: PeerInfo[];
-  roomPeers: PeerInfo[];
+  availablePeers: PeerInfo[];
+  connectedPeers: PeerInfo[];
+  connectionStates: Record<string, PeerConnectionState>;
   selectedPeerId: string | null;
   onSelectPeer: (peer: PeerInfo) => void;
+  onRequestConnect: (peer: PeerInfo) => void;
+  onDisconnectPeer: (peerId: string) => void;
   onOpenPairing: () => void;
   lang: Language;
 }
@@ -36,10 +42,13 @@ export const DeviceListPanel: React.FC<DeviceListPanelProps> = ({
   onRenameDevice,
   wsConnected,
   roomCode,
-  nearbyPeers,
-  roomPeers,
+  availablePeers,
+  connectedPeers,
+  connectionStates,
   selectedPeerId,
   onSelectPeer,
+  onRequestConnect,
+  onDisconnectPeer,
   onOpenPairing,
   lang,
 }) => {
@@ -55,9 +64,9 @@ export const DeviceListPanel: React.FC<DeviceListPanelProps> = ({
     setEditing(false);
   };
 
-  const roomPeerIds = new Set(roomPeers.map((p) => p.id));
-  const dedupedNearby = nearbyPeers.filter((p) => !roomPeerIds.has(p.id));
-  const totalAvailable = roomPeers.length + dedupedNearby.length;
+  const connectedIds = new Set(connectedPeers.map((p) => p.id));
+  const unconnectedAvailable = availablePeers.filter((p) => !connectedIds.has(p.id));
+  const totalVisible = connectedPeers.length + unconnectedAvailable.length;
 
   return (
     <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden">
@@ -110,7 +119,7 @@ export const DeviceListPanel: React.FC<DeviceListPanelProps> = ({
         )}
       </div>
 
-      {/* Available & Connected Devices Section */}
+      {/* Connected & Available Devices List */}
       <div className="p-5">
         <div className="flex items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
           <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
@@ -118,18 +127,16 @@ export const DeviceListPanel: React.FC<DeviceListPanelProps> = ({
           </h2>
           <span
             className={`text-xs font-medium tabular-nums ${
-              totalAvailable > 0
+              totalVisible > 0
                 ? 'text-emerald-700 dark:text-emerald-400'
                 : 'text-slate-500 dark:text-slate-400'
             }`}
           >
-            {totalAvailable > 0
-              ? `${totalAvailable} ${t.devicesOnlineCount}`
-              : t.noDevicesBadge}
+            {totalVisible > 0 ? `${totalVisible} ${t.devicesOnlineCount}` : t.noDevicesBadge}
           </span>
         </div>
 
-        {totalAvailable === 0 ? (
+        {totalVisible === 0 ? (
           <div className="py-6 text-center">
             <div className="w-12 h-12 mx-auto rounded-2xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-500 dark:text-slate-400">
               <Wifi className="w-6 h-6" />
@@ -151,102 +158,112 @@ export const DeviceListPanel: React.FC<DeviceListPanelProps> = ({
           </div>
         ) : (
           <div className="mt-4 space-y-5">
-            {roomPeers.length > 0 && (
+            {/* Connected Devices */}
+            {connectedPeers.length > 0 && (
               <div>
-                <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">
-                  {t.pairedDevices} · Room {roomCode}
+                <h3 className="text-xs font-medium text-emerald-700 dark:text-emerald-400 mb-2">
+                  {t.connectedDevicesSection}
                 </h3>
                 <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {roomPeers.map((peer) => {
+                  {connectedPeers.map((peer) => {
                     const isSelected = selectedPeerId === peer.id;
                     return (
-                      <button
+                      <div
                         key={peer.id}
-                        type="button"
-                        onClick={() => onSelectPeer(peer)}
-                        className={`w-full min-h-[60px] py-3 px-3 -mx-1 rounded-xl flex items-center justify-between gap-3 text-left transition-colors ${
+                        className={`py-3 px-3 -mx-1 rounded-xl flex items-center justify-between gap-2 transition-colors ${
                           isSelected
-                            ? 'bg-blue-50 dark:bg-blue-950/50 text-blue-900 dark:text-blue-100'
-                            : 'hover:bg-slate-50 dark:hover:bg-slate-800/60 text-slate-900 dark:text-slate-100'
+                            ? 'bg-emerald-50/80 dark:bg-emerald-950/30'
+                            : 'hover:bg-slate-50 dark:hover:bg-slate-800/50'
                         }`}
                       >
-                        <div className="flex items-center gap-3 min-w-0">
-                          <div
-                            className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-                              isSelected
-                                ? 'bg-blue-600 text-white'
-                                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
-                            }`}
-                          >
+                        <button
+                          type="button"
+                          onClick={() => onSelectPeer(peer)}
+                          className="flex items-center gap-3 min-w-0 flex-1 text-left min-h-[44px]"
+                        >
+                          <div className="w-10 h-10 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0">
                             <PeerIcon type={peer.deviceType} />
                           </div>
                           <div className="min-w-0">
-                            <p className="text-sm font-semibold truncate">{peer.name}</p>
-                            <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                              {peer.os} · {peer.browser} · Room {roomCode}
+                            <p className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                              {peer.name}
+                            </p>
+                            <p className="text-xs text-emerald-700 dark:text-emerald-400 truncate flex items-center gap-1">
+                              <CheckCircle2 className="w-3 h-3 shrink-0" />
+                              <span>
+                                {t.activeBridgeLabel} · {peer.os} · {peer.sameNetwork ? 'Same Wi-Fi' : 'Online'}
+                              </span>
                             </p>
                           </div>
-                        </div>
-                        <span
-                          className={`inline-flex items-center gap-1 text-xs font-medium shrink-0 ${
-                            isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-emerald-700 dark:text-emerald-400'
-                          }`}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => onDisconnectPeer(peer.id)}
+                          className="min-h-[36px] px-2.5 rounded-lg text-xs font-medium text-slate-500 hover:text-rose-600 dark:text-slate-400 dark:hover:text-rose-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1 shrink-0"
+                          title={t.disconnectBtn}
                         >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>{isSelected ? 'Selected' : 'Connected'}</span>
-                        </span>
-                      </button>
+                          <Unlink className="w-3.5 h-3.5" />
+                          <span className="hidden sm:inline">{t.disconnectBtn}</span>
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
               </div>
             )}
 
-            {dedupedNearby.length > 0 && (
+            {/* Available Devices Waiting to Connect */}
+            {unconnectedAvailable.length > 0 && (
               <div>
                 <h3 className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">
                   {t.nearbyDevices}
                 </h3>
                 <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {dedupedNearby.map((peer) => {
-                    const isSelected = selectedPeerId === peer.id;
+                  {unconnectedAvailable.map((peer) => {
+                    const state = connectionStates[peer.id] || 'idle';
                     return (
-                      <button
+                      <div
                         key={peer.id}
-                        type="button"
-                        onClick={() => onSelectPeer(peer)}
-                        className={`w-full min-h-[60px] py-3 px-3 -mx-1 rounded-xl flex items-center justify-between gap-3 text-left transition-colors ${
-                          isSelected
-                            ? 'bg-blue-50 dark:bg-blue-950/50 text-blue-900 dark:text-blue-100'
-                            : 'hover:bg-slate-50 dark:hover:bg-slate-800/60 text-slate-900 dark:text-slate-100'
-                        }`}
+                        className="py-3 px-2 -mx-1 rounded-xl flex items-center justify-between gap-3"
                       >
                         <div className="flex items-center gap-3 min-w-0">
-                          <div
-                            className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-                              isSelected
-                                ? 'bg-blue-600 text-white'
-                                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
-                            }`}
-                          >
+                          <div className="w-10 h-10 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 flex items-center justify-center shrink-0">
                             <PeerIcon type={peer.deviceType} />
                           </div>
                           <div className="min-w-0">
-                            <p className="text-sm font-semibold truncate">{peer.name}</p>
+                            <p className="text-sm font-semibold text-slate-900 dark:text-slate-100 truncate">
+                              {peer.name}
+                            </p>
                             <p className="text-xs text-slate-500 dark:text-slate-400 truncate">
-                              {peer.os} · {peer.browser} · Same Wi-Fi
+                              {peer.os} · {peer.browser} · {peer.sameNetwork ? 'Same Wi-Fi' : 'Online'}
+                              {state === 'skipped' ? ` · ${t.skippedLabel}` : ''}
                             </p>
                           </div>
                         </div>
-                        <span
-                          className={`inline-flex items-center gap-1 text-xs font-medium shrink-0 ${
-                            isSelected ? 'text-blue-600 dark:text-blue-400' : 'text-emerald-700 dark:text-emerald-400'
+
+                        <button
+                          type="button"
+                          onClick={() => onRequestConnect(peer)}
+                          disabled={state === 'requesting'}
+                          className={`min-h-[40px] px-3.5 py-2 rounded-xl text-xs font-medium transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                            state === 'requesting'
+                              ? 'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 cursor-wait'
+                              : 'bg-blue-600 hover:bg-blue-700 text-white'
                           }`}
                         >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          <span>{isSelected ? 'Selected' : 'Online'}</span>
-                        </span>
-                      </button>
+                          {state === 'requesting' ? (
+                            <>
+                              <Clock className="w-3.5 h-3.5" />
+                              <span>{t.waitingBtn}</span>
+                            </>
+                          ) : (
+                            <>
+                              <Link2 className="w-3.5 h-3.5" />
+                              <span>{t.connectBtn}</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
                     );
                   })}
                 </div>

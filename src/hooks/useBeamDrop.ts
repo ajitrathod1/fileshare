@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   FileManifestItem,
+  IncomingConnectionRequest,
   IncomingOfferBatch,
+  PeerConnectionState,
   PeerInfo,
   TransferRecord,
   TransportMode,
@@ -106,6 +108,10 @@ export function useBeamDrop() {
   const [deviceName, setDeviceNameState] = useState<string>(initialDevice.name);
   const [nearbyPeers, setNearbyPeers] = useState<PeerInfo[]>([]);
   const [roomPeers, setRoomPeers] = useState<PeerInfo[]>([]);
+  const [availablePeers, setAvailablePeers] = useState<PeerInfo[]>([]);
+  const [connectedPeers, setConnectedPeers] = useState<PeerInfo[]>([]);
+  const [connectionStates, setConnectionStates] = useState<Record<string, PeerConnectionState>>({});
+  const [incomingConnectRequests, setIncomingConnectRequests] = useState<IncomingConnectionRequest[]>([]);
   const [transfers, setTransfers] = useState<TransferRecord[]>([]);
   const [incomingOffers, setIncomingOffers] = useState<IncomingOfferBatch[]>([]);
   const [autoAccept, setAutoAccept] = useState<boolean>(false);
@@ -662,11 +668,62 @@ export function useBeamDrop() {
             setNearbyPeers(list.map((p) => ({ ...p, scope: 'nearby' })));
           } else if (msg.scope === 'pair') {
             setRoomPeers(list.map((p) => ({ ...p, scope: 'pair' })));
+          } else if (msg.scope === 'available') {
+            setAvailablePeers(list.map((p) => ({ ...p, scope: 'available' })));
+            // Sync names for already connected peers
+            setConnectedPeers((prev) =>
+              prev
+                .map((cp) => {
+                  const fresh = list.find((item) => item.id === cp.id);
+                  return fresh ? { ...cp, ...fresh } : cp;
+                })
+                .filter((cp) => list.some((item) => item.id === cp.id))
+            );
           }
           return;
         }
 
         const fromId = typeof msg.from === 'string' ? msg.from : '';
+
+        if (type === 'connect:request' && msg.fromPeer) {
+          const fromPeer = msg.fromPeer as PeerInfo;
+          setIncomingConnectRequests((prev) => {
+            if (prev.some((r) => r.fromPeer.id === fromPeer.id)) return prev;
+            return [
+              ...prev,
+              {
+                requestId: `creq-${Date.now()}-${fromPeer.id}`,
+                fromPeer,
+                createdAt: Date.now(),
+              },
+            ];
+          });
+          return;
+        }
+
+        if (type === 'connect:established' && msg.peer) {
+          const peer = msg.peer as PeerInfo;
+          setConnectedPeers((prev) => {
+            if (prev.some((p) => p.id === peer.id)) {
+              return prev.map((p) => (p.id === peer.id ? peer : p));
+            }
+            return [peer, ...prev];
+          });
+          setConnectionStates((prev) => ({ ...prev, [peer.id]: 'connected' }));
+          return;
+        }
+
+        if (type === 'connect:skip' && fromId) {
+          setConnectionStates((prev) => ({ ...prev, [fromId]: 'skipped' }));
+          return;
+        }
+
+        if (type === 'connect:disconnected' && typeof msg.peerId === 'string') {
+          const deadId = msg.peerId;
+          setConnectedPeers((prev) => prev.filter((p) => p.id !== deadId));
+          setConnectionStates((prev) => ({ ...prev, [deadId]: 'idle' }));
+          return;
+        }
 
         if (type === 'webrtc:offer' && fromId && msg.sdp) {
           const pc = createPeerConnection(fromId, false);
@@ -932,22 +989,78 @@ export function useBeamDrop() {
     });
   }, []);
 
+  const requestConnection = useCallback(
+    (peer: PeerInfo) => {
+      setConnectionStates((prev) => ({ ...prev, [peer.id]: 'requesting' }));
+      sendWsJson({
+        type: 'connect:request',
+        targetId: peer.id,
+      });
+    },
+    [sendWsJson]
+  );
+
+  const acceptConnectionRequest = useCallback(
+    (req: IncomingConnectionRequest) => {
+      setIncomingConnectRequests((prev) => prev.filter((item) => item.requestId !== req.requestId));
+      sendWsJson({
+        type: 'connect:accept',
+        targetId: req.fromPeer.id,
+      });
+    },
+    [sendWsJson]
+  );
+
+  const skipConnectionRequest = useCallback(
+    (req: IncomingConnectionRequest) => {
+      setIncomingConnectRequests((prev) => prev.filter((item) => item.requestId !== req.requestId));
+      sendWsJson({
+        type: 'connect:skip',
+        targetId: req.fromPeer.id,
+      });
+    },
+    [sendWsJson]
+  );
+
+  const disconnectPeer = useCallback(
+    (peerId: string) => {
+      setConnectedPeers((prev) => prev.filter((p) => p.id !== peerId));
+      setConnectionStates((prev) => ({ ...prev, [peerId]: 'idle' }));
+      sendWsJson({
+        type: 'connect:disconnect',
+        targetId: peerId,
+      });
+    },
+    [sendWsJson]
+  );
+
   const allPeers = useMemo(() => {
     const map = new Map<string, PeerInfo>();
-    for (const p of roomPeers) map.set(p.id, p);
+    for (const p of connectedPeers) map.set(p.id, p);
+    for (const p of roomPeers) {
+      if (!map.has(p.id)) map.set(p.id, p);
+    }
     for (const p of nearbyPeers) {
       if (!map.has(p.id)) map.set(p.id, p);
     }
+    for (const p of availablePeers) {
+      if (!map.has(p.id)) map.set(p.id, p);
+    }
     return Array.from(map.values());
-  }, [nearbyPeers, roomPeers]);
+  }, [availablePeers, connectedPeers, nearbyPeers, roomPeers]);
 
   return {
     wsConnected,
     myPeerId,
     roomCode,
     deviceName,
+    myDeviceInfo: initialDevice,
     nearbyPeers,
     roomPeers,
+    availablePeers,
+    connectedPeers,
+    connectionStates,
+    incomingConnectRequests,
     allPeers,
     transfers,
     incomingOffers,
@@ -960,6 +1073,10 @@ export function useBeamDrop() {
     updateDeviceName,
     joinRoomCode,
     createNewRoomCode,
+    requestConnection,
+    acceptConnectionRequest,
+    skipConnectionRequest,
+    disconnectPeer,
     sendFilesToPeer,
     acceptOfferBatch,
     declineOfferBatch,
